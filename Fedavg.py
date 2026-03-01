@@ -6,6 +6,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 from demo import MobileNetV2UNet
 import os
+import sys
 import time
 from PIL import Image
 from torch.utils.data import Dataset
@@ -56,10 +57,10 @@ def get_gpu_memory_info(device):
     if not torch.cuda.is_available():
         return None
 
-    allocated = torch.cuda.memory_allocated(device) / 1024 ** 2      # 已分配
-    cached = torch.cuda.memory_reserved(device) / 1024 ** 2          # 已缓存（PyTorch 显存池）
-    total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2  # 总显存
-    free = total - cached                                              # 空闲显存
+    allocated = torch.cuda.memory_allocated(device) / 1024 ** 2
+    cached = torch.cuda.memory_reserved(device) / 1024 ** 2
+    total = torch.cuda.get_device_properties(device).total_mem / 1024 ** 2
+    free = total - cached
 
     return {
         'allocated_mb': allocated,
@@ -91,13 +92,12 @@ def auto_batch_size(device, base_batch_size=32):
     if not torch.cuda.is_available():
         return base_batch_size
 
-    total = (torch.cuda.get_device_properties(device).total_memory/ 1024 ** 2)
+    total = torch.cuda.get_device_properties(device).total_mem / 1024 ** 2
     # 预留 500MB 给系统和其他进程
     available = total - 500
 
-    # 估算：模型固定开销 ~200MB，每个样本 ~40MB (256x256, FP32)
-    # 使用 AMP 时每个样本 ~25MB
-    per_sample_mb = 25  # AMP 模式
+    # 估算：模型固定开销 ~200MB，每个样本 ~25MB (AMP 模式)
+    per_sample_mb = 25
     fixed_overhead_mb = 200
 
     recommended = int((available - fixed_overhead_mb) / per_sample_mb)
@@ -157,7 +157,6 @@ def evaluate_model(model, val_loader, device, use_amp=True):
             images = images.to(device)
             labels = labels.to(device)
 
-            # 验证时也使用 AMP 加速推理
             with autocast(enabled=use_amp and torch.cuda.is_available()):
                 output = model(images)
 
@@ -184,7 +183,6 @@ class Client:
         self.client_id = client_id
         self.device = device
         self.use_amp = use_amp and torch.cuda.is_available()
-        # batch_size 由外部传入的 dataset 的 DataLoader 控制
         self.train_loader = None
         self.dataset = dataset
         self.indices = indices
@@ -198,13 +196,13 @@ class Client:
         4. pin_memory=True：加速 CPU→GPU 数据传输
         5. cudnn.benchmark=True：自动选择最优卷积算法
         """
-        # 创建 DataLoader（使用优化参数）
         self.train_loader = DataLoader(
             Subset(self.dataset, self.indices),
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),  # 避免每次重建子进程的开销
             drop_last=False
         )
 
@@ -213,7 +211,6 @@ class Client:
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
         criterion = torch.nn.CrossEntropyLoss()
 
-        # AMP 混合精度训练的 GradScaler
         scaler = GradScaler(enabled=self.use_amp)
 
         for epoch in range(epochs):
@@ -221,14 +218,12 @@ class Client:
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
 
-                optimizer.zero_grad(set_to_none=True)  # 比 zero_grad() 更快
+                optimizer.zero_grad(set_to_none=True)
 
-                # AMP 混合精度前向传播
                 with autocast(enabled=self.use_amp):
                     output = model(images)
                     loss = criterion(output, labels)
 
-                # AMP 混合精度反向传播
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -294,11 +289,10 @@ def main():
     # ===== GPU 信息 =====
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(device)
-        total_mem = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
+        total_mem = torch.cuda.get_device_properties(device).total_mem / 1024 ** 2
         print(f"GPU 型号: {gpu_name}")
         print(f"GPU 总显存: {total_mem:.0f} MB")
 
-        # 启用 cuDNN benchmark 模式（自动选择最优卷积算法）
         torch.backends.cudnn.benchmark = True
         print("cuDNN benchmark: 已启用")
     else:
@@ -309,14 +303,23 @@ def main():
     # ==================== 配置区 ====================
     # 您可以根据自己的 GPU 显存大小调整以下参数
 
-    USE_AMP = True          # 是否启用混合精度训练 (推荐开启)
-    NUM_WORKERS = 4         # 数据加载的子进程数 (建议设为 CPU 核心数的一半)
-    PIN_MEMORY = True       # 是否锁页内存 (有 GPU 时推荐开启)
+    USE_AMP = True            # 是否启用混合精度训练 (推荐开启)
     TARGET_SIZE = (256, 256)  # 输入图像尺寸
-    NUM_ROUNDS = 20         # 联邦训练轮数
-    NUM_CLIENTS = 5         # 客户端数量
-    LOCAL_EPOCHS = 1        # 每个客户端的本地训练轮数
-    LR = 0.01               # 学习率
+    NUM_ROUNDS = 20           # 联邦训练轮数
+    NUM_CLIENTS = 5           # 客户端数量
+    LOCAL_EPOCHS = 1          # 每个客户端的本地训练轮数
+    LR = 0.01                 # 学习率
+
+    # ★ Windows 多进程修复：
+    # Windows 上 num_workers > 0 需要在 if __name__ == "__main__" 保护下运行，
+    # 否则子进程会重复执行主模块导致卡死。
+    # 如果您在 Windows 上仍然遇到卡死问题，请将 NUM_WORKERS 设为 0。
+    if sys.platform == 'win32':
+        NUM_WORKERS = 0       # Windows 默认使用 0，避免多进程卡死
+        PIN_MEMORY = True     # 锁页内存仍然可以启用
+    else:
+        NUM_WORKERS = 4       # Linux/Mac 可以使用多进程加载
+        PIN_MEMORY = True
 
     # BATCH_SIZE: 设为 0 表示自动推荐，或手动指定一个固定值
     BATCH_SIZE = 0  # 0 = 自动推荐
