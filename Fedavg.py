@@ -50,10 +50,7 @@ def rgb_mask_to_class_index(mask_rgb, color_map=CAMVID_COLORS):
 # ==================== 显存监控工具 ====================
 
 def get_gpu_memory_info(device):
-    """
-    获取 GPU 显存信息（单位：MB）
-    返回: (已分配, 已缓存, 总显存, 空闲显存)
-    """
+    """获取 GPU 显存信息（单位：MB）"""
     if not torch.cuda.is_available():
         return None
 
@@ -84,30 +81,38 @@ def print_gpu_status(device, label=""):
           f"利用率 {info['utilization_pct']:.1f}%")
 
 
-def auto_batch_size(device, base_batch_size=32):
+def auto_batch_size(device, num_data_per_client, base_batch_size=32):
     """
-    根据 GPU 空闲显存自动推荐 batch_size
-    MobileNetV2-UNet 在 256x256 输入下，每增加 batch_size 1 约需 ~40MB 显存
+    根据 GPU 显存和每个客户端的数据量，智能推荐 batch_size。
+
+    核心原则：
+    - batch_size 不应超过单个客户端的数据量，否则每个 epoch 只有 1 步梯度更新，
+      训练严重不充分。
+    - batch_size 理想范围是客户端数据量的 1/3 ~ 1/2，确保每个 epoch 有 2~3 步更新。
+    - 同时不能超过 GPU 显存的承载能力。
     """
-    if not torch.cuda.is_available():
-        return base_batch_size
+    # 1. 根据数据量确定上限：不超过客户端数据量的一半
+    data_limit = max(8, num_data_per_client // 2)
 
-    total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
-    # 预留 500MB 给系统和其他进程
-    available = total - 500
+    # 2. 根据 GPU 显存确定上限
+    if torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
+        available = total - 500  # 预留 500MB
+        per_sample_mb = 25  # AMP 模式下每个样本约 25MB
+        fixed_overhead_mb = 200
+        gpu_limit = int((available - fixed_overhead_mb) / per_sample_mb)
+        gpu_limit = max(8, gpu_limit)
+    else:
+        gpu_limit = base_batch_size
 
-    # 估算：模型固定开销 ~200MB，每个样本 ~25MB (AMP 模式)
-    per_sample_mb = 25
-    fixed_overhead_mb = 200
+    # 3. 取两者中的较小值
+    recommended = min(data_limit, gpu_limit)
 
-    recommended = int((available - fixed_overhead_mb) / per_sample_mb)
-    # 取最近的 2 的幂次，且不小于 8
-    recommended = max(8, min(recommended, 512))
-    # 向下取到最近的 2 的幂次
+    # 4. 向下取到最近的 2 的幂次（方便 GPU 对齐），且不小于 4
     power = 1
     while power * 2 <= recommended:
         power *= 2
-    recommended = power
+    recommended = max(4, power)
 
     return recommended
 
@@ -189,12 +194,10 @@ class Client:
 
     def local_train(self, model, batch_size=32, epochs=1, lr=0.01, num_workers=0, pin_memory=False):
         """
-        加速优化点：
-        1. AMP 混合精度训练 (FP16)：显存减半，速度提升 1.5-3x
-        2. 更大的 batch_size：充分利用空闲显存
-        3. num_workers > 0：多进程数据加载，减少 CPU-GPU 等待
-        4. pin_memory=True：加速 CPU→GPU 数据传输
-        5. cudnn.benchmark=True：自动选择最优卷积算法
+        本地训练，包含以下加速优化：
+        1. AMP 混合精度训练 (FP16)
+        2. pin_memory 加速 CPU→GPU 数据传输
+        3. cudnn.benchmark 自动选择最优卷积算法
         """
         self.train_loader = DataLoader(
             Subset(self.dataset, self.indices),
@@ -202,7 +205,7 @@ class Client:
             shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            persistent_workers=(num_workers > 0),  # 避免每次重建子进程的开销
+            persistent_workers=(num_workers > 0),
             drop_last=False
         )
 
@@ -213,7 +216,10 @@ class Client:
 
         scaler = GradScaler(enabled=self.use_amp)
 
+        epoch_losses = []
         for epoch in range(epochs):
+            running_loss = 0.0
+            num_batches = 0
             for images, labels in self.train_loader:
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
@@ -228,7 +234,13 @@ class Client:
                 scaler.step(optimizer)
                 scaler.update()
 
-        return model.state_dict()
+                running_loss += loss.item()
+                num_batches += 1
+
+            epoch_losses.append(running_loss / max(num_batches, 1))
+
+        avg_loss = np.mean(epoch_losses)
+        return model.state_dict(), avg_loss
 
 
 class CamVidDataset(Dataset):
@@ -301,59 +313,68 @@ def main():
     from torchvision import transforms
 
     # ==================== 配置区 ====================
-    # 您可以根据自己的 GPU 显存大小调整以下参数
+    # 您可以根据自己的 GPU 显存大小和数据集规模调整以下参数
 
     USE_AMP = True            # 是否启用混合精度训练 (推荐开启)
     TARGET_SIZE = (256, 256)  # 输入图像尺寸
-    NUM_ROUNDS = 20           # 联邦训练轮数
+    NUM_ROUNDS = 50           # 联邦训练轮数 (增加到 50 轮以确保充分收敛)
     NUM_CLIENTS = 5           # 客户端数量
-    LOCAL_EPOCHS = 1          # 每个客户端的本地训练轮数
+    LOCAL_EPOCHS = 5          # 每个客户端的本地训练轮数 (增加到 5 轮以充分利用本地数据)
     LR = 0.01                 # 学习率
 
-    # ★ Windows 多进程修复：
-    # Windows 上 num_workers > 0 需要在 if __name__ == "__main__" 保护下运行，
-    # 否则子进程会重复执行主模块导致卡死。
-    # 如果您在 Windows 上仍然遇到卡死问题，请将 NUM_WORKERS 设为 0。
+    # ★ Windows 多进程修复
     if sys.platform == 'win32':
-        NUM_WORKERS = 0       # Windows 默认使用 0，避免多进程卡死
-        PIN_MEMORY = True     # 锁页内存仍然可以启用
+        NUM_WORKERS = 0
+        PIN_MEMORY = True
     else:
-        NUM_WORKERS = 4       # Linux/Mac 可以使用多进程加载
+        NUM_WORKERS = 4
         PIN_MEMORY = True
 
-    # BATCH_SIZE: 设为 0 表示自动推荐，或手动指定一个固定值
+    # BATCH_SIZE: 设为 0 表示自动推荐，或手动指定一个固定值 (如 16, 32)
     BATCH_SIZE = 0  # 0 = 自动推荐
 
     # ================================================
 
-    # ===== 自动推荐 batch_size =====
-    if BATCH_SIZE == 0:
-        BATCH_SIZE = auto_batch_size(device)
-    print(f"\n实际 Batch Size: {BATCH_SIZE}")
-    print(f"混合精度训练 (AMP): {'已启用' if USE_AMP and torch.cuda.is_available() else '未启用'}")
-    print(f"数据加载进程数: {NUM_WORKERS}")
-    print(f"锁页内存 (Pin Memory): {'已启用' if PIN_MEMORY else '未启用'}")
-
-    # ===== 1. 初始化全局模型 =====
-    global_model = MobileNetV2UNet(num_classes=NUM_CLASSES).to(device)
-
-    # 打印模型参数量
-    total_params = sum(p.numel() for p in global_model.parameters())
-    trainable_params = sum(p.numel() for p in global_model.parameters() if p.requires_grad)
-    print(f"\n模型总参数量: {total_params:,} ({total_params * 4 / 1024 ** 2:.1f} MB in FP32)")
-    print(f"可训练参数量: {trainable_params:,}")
-
-    # ===== 2. 加载数据集 =====
+    # ===== 1. 加载数据集（先加载，才能根据数据量推荐 batch_size） =====
     train_dataset = CamVidDataset('./data', split='train', transform=transforms.ToTensor(), target_size=TARGET_SIZE)
     val_dataset = CamVidDataset('./data', split='val', transform=transforms.ToTensor(), target_size=TARGET_SIZE)
-
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
 
     num_images = len(train_dataset)
     indices = np.arange(num_images)
     np.random.shuffle(indices)
     user_groups = np.array_split(indices, NUM_CLIENTS)
+
+    # 计算每个客户端的平均数据量
+    avg_data_per_client = num_images // NUM_CLIENTS
+    min_data_per_client = min(len(g) for g in user_groups)
+
+    # ===== 自动推荐 batch_size =====
+    if BATCH_SIZE == 0:
+        BATCH_SIZE = auto_batch_size(device, min_data_per_client)
+
+    # 打印训练配置
+    print(f"\n{'='*60}")
+    print(f"训练配置:")
+    print(f"  训练集: {num_images} 张 | 验证集: {len(val_dataset)} 张")
+    print(f"  客户端: {NUM_CLIENTS} 个 | 每客户端约 {avg_data_per_client} 张 (最少 {min_data_per_client} 张)")
+    print(f"  Batch Size: {BATCH_SIZE} (每客户端每 epoch 约 {min_data_per_client // BATCH_SIZE + 1} 步)")
+    print(f"  Local Epochs: {LOCAL_EPOCHS} | 联邦轮数: {NUM_ROUNDS}")
+    print(f"  每客户端每轮总梯度更新步数: ~{LOCAL_EPOCHS * (min_data_per_client // BATCH_SIZE + 1)}")
+    print(f"  学习率: {LR}")
+    print(f"  混合精度 (AMP): {'已启用' if USE_AMP and torch.cuda.is_available() else '未启用'}")
+    print(f"  数据加载进程数: {NUM_WORKERS}")
+    print(f"{'='*60}")
+
+    # ===== 2. 初始化全局模型 =====
+    global_model = MobileNetV2UNet(num_classes=NUM_CLASSES).to(device)
+
+    total_params = sum(p.numel() for p in global_model.parameters())
+    trainable_params = sum(p.numel() for p in global_model.parameters() if p.requires_grad)
+    print(f"\n模型总参数量: {total_params:,} ({total_params * 4 / 1024 ** 2:.1f} MB in FP32)")
+    print(f"可训练参数量: {trainable_params:,}")
+
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
 
     # ===== 3. 创建保存目录 =====
     save_dir = './checkpoints'
@@ -368,8 +389,8 @@ def main():
     history = []
     best_miou = 0.0
 
-    print(f"\n训练集: {len(train_dataset)} 张 | 验证集: {len(val_dataset)} 张 | "
-          f"客户端: {NUM_CLIENTS} | 总轮数: {NUM_ROUNDS}")
+    print(f"\n{'='*80}")
+    print(f"开始联邦训练...")
     print(f"{'='*80}")
 
     total_train_time = 0.0
@@ -380,11 +401,17 @@ def main():
 
         local_weights = []
         local_lens = []
+        round_losses = []
 
         for i in range(NUM_CLIENTS):
             client = Client(i, train_dataset, user_groups[i], device, use_amp=USE_AMP)
             local_model = copy.deepcopy(global_model)
-            weights = client.local_train(
+
+            # ★ 在第一个客户端训练时监控显存（此时 GPU 正在工作）
+            if i == 0 and round_idx == 0 and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)
+
+            weights, avg_loss = client.local_train(
                 local_model,
                 batch_size=BATCH_SIZE,
                 epochs=LOCAL_EPOCHS,
@@ -392,18 +419,26 @@ def main():
                 num_workers=NUM_WORKERS,
                 pin_memory=PIN_MEMORY
             )
+
+            # ★ 在第一轮第一个客户端训练完成后立即打印训练时的峰值显存
+            if i == 0 and round_idx == 0 and torch.cuda.is_available():
+                train_peak = torch.cuda.max_memory_allocated(device) / 1024 ** 2
+                total_gpu = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
+                print(f"  [训练时峰值显存] {train_peak:.0f}MB / {total_gpu:.0f}MB ({train_peak/total_gpu*100:.1f}%)")
+
             local_weights.append(weights)
             local_lens.append(len(user_groups[i]))
+            round_losses.append(avg_loss)
 
-            # 及时释放不再需要的本地模型，回收显存
             del local_model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        avg_round_loss = np.mean(round_losses)
+
         # ----- 服务端聚合 -----
         global_model = federated_aggregate(global_model, local_weights, local_lens)
 
-        # 释放本地权重
         del local_weights
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -411,22 +446,17 @@ def main():
         round_time = time.time() - round_start
         total_train_time += round_time
 
-        # ----- 显存监控 -----
-        print_gpu_status(device, "聚合后")
-        if torch.cuda.is_available():
-            peak_mem = torch.cuda.max_memory_allocated(device) / 1024 ** 2
-            print(f"  [峰值显存] {peak_mem:.0f} MB")
-
         # ----- 每轮验证 -----
         pixel_acc, miou = evaluate_model(global_model, val_loader, device, use_amp=USE_AMP)
         history.append({
             'round': round_idx + 1,
             'pixel_acc': pixel_acc,
             'miou': miou,
+            'loss': avg_round_loss,
             'time': round_time
         })
 
-        print(f"  [验证] Pixel Acc: {pixel_acc:.4f} | mIoU: {miou:.4f} | 耗时: {round_time:.1f}s", end="")
+        print(f"  Loss: {avg_round_loss:.4f} | Pixel Acc: {pixel_acc:.4f} | mIoU: {miou:.4f} | 耗时: {round_time:.1f}s", end="")
 
         # ----- 保存最优模型 -----
         if miou > best_miou:
@@ -439,12 +469,12 @@ def main():
                 'pixel_acc': pixel_acc,
                 'miou': miou,
             }, best_path)
-            print(f"  ★ 新最优模型 (mIoU: {miou:.4f})")
+            print(f"  ★ Best (mIoU: {miou:.4f})")
         else:
             print()
 
-        # ----- 每 5 轮保存检查点 -----
-        if (round_idx + 1) % 5 == 0:
+        # ----- 每 10 轮保存检查点 -----
+        if (round_idx + 1) % 10 == 0:
             ckpt_path = os.path.join(save_dir, f'global_model_round_{round_idx + 1}.pth')
             torch.save({
                 'round': round_idx + 1,
@@ -487,11 +517,11 @@ def main():
     print(f"  总训练时间:   {total_train_time:.1f}s ({total_train_time / 60:.1f} min)")
     print(f"  平均每轮耗时: {total_train_time / NUM_ROUNDS:.1f}s")
 
-    print(f"\n{'Round':<8} {'Pixel Acc':<14} {'mIoU':<14} {'耗时(s)':<10}")
-    print(f"{'-'*46}")
+    print(f"\n{'Round':<8} {'Loss':<12} {'Pixel Acc':<14} {'mIoU':<14} {'耗时(s)':<10}")
+    print(f"{'-'*58}")
     for h in history:
-        print(f"{h['round']:<8} {h['pixel_acc']:<14.4f} {h['miou']:<14.4f} {h['time']:<10.1f}")
-    print(f"{'-'*46}")
+        print(f"{h['round']:<8} {h['loss']:<12.4f} {h['pixel_acc']:<14.4f} {h['miou']:<14.4f} {h['time']:<10.1f}")
+    print(f"{'-'*58}")
     print(f"\n最优 mIoU: {best_miou:.4f}")
     print(f"最优模型: {os.path.join(save_dir, 'best_model.pth')}")
     print(f"最终模型: {final_path}")
