@@ -59,7 +59,7 @@ def get_gpu_memory_info(device):
 
     allocated = torch.cuda.memory_allocated(device) / 1024 ** 2
     cached = torch.cuda.memory_reserved(device) / 1024 ** 2
-    total = torch.cuda.get_device_properties(device).total_mem / 1024 ** 2
+    total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
     free = total - cached
 
     return {
@@ -92,7 +92,7 @@ def auto_batch_size(device, base_batch_size=32):
     if not torch.cuda.is_available():
         return base_batch_size
 
-    total = torch.cuda.get_device_properties(device).total_mem / 1024 ** 2
+    total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
     # 预留 500MB 给系统和其他进程
     available = total - 500
 
@@ -289,7 +289,7 @@ def main():
     # ===== GPU 信息 =====
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(device)
-        total_mem = torch.cuda.get_device_properties(device).total_mem / 1024 ** 2
+        total_mem = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
         print(f"GPU 型号: {gpu_name}")
         print(f"GPU 总显存: {total_mem:.0f} MB")
 
@@ -473,7 +473,7 @@ def main():
     # GPU 显存总结
     if torch.cuda.is_available():
         peak_mem = torch.cuda.max_memory_allocated(device) / 1024 ** 2
-        total_mem = torch.cuda.get_device_properties(device).total_mem / 1024 ** 2
+        total_mem = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
         print(f"\n[GPU 显存总结]")
         print(f"  GPU 型号:     {torch.cuda.get_device_name(device)}")
         print(f"  总显存:       {total_mem:.0f} MB")
