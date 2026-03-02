@@ -342,6 +342,10 @@ def build_label_index_cityscapes(dataset_root, split='train',
     为 Cityscapes 训练集中的每张图像计算主类别标签（trainId），
     返回 ndarray (N,)，供 partition.py 的 dirichlet_partition() 使用。
 
+    重要：本函数使用与 CityscapesDataset 完全相同的文件扫描逻辑
+    （先扫 leftImg8bit 图像，再匹配对应 gtFine 标签），
+    保证返回的标签数组长度与数据集样本数严格一致，防止索引越界。
+
     结果缓存到 {dataset_root}/cityscapes_partition_cache_{split}.npy。
 
     参数
@@ -355,30 +359,54 @@ def build_label_index_cityscapes(dataset_root, split='train',
     cache_path = os.path.join(
         dataset_root, f'cityscapes_partition_cache_{split}.npy'
     )
-    if cache and os.path.exists(cache_path):
-        labels = np.load(cache_path)
-        print(f"  [Partition] 加载 Cityscapes 主类别缓存: {cache_path}  ({len(labels)} 张)")
-        return labels
 
+    # --- 使用与 CityscapesDataset 相同的逻辑收集有效的图像-标签对 ---
+    img_root  = os.path.join(dataset_root, 'leftImg8bit', split)
     mask_root = os.path.join(dataset_root, 'gtFine', split)
-    mask_files = sorted(glob.glob(
-        os.path.join(mask_root, '**', '*_gtFine_labelIds.png'), recursive=True
+
+    img_files = sorted(glob.glob(
+        os.path.join(img_root, '**', '*_leftImg8bit.png'), recursive=True
     ))
 
-    if len(mask_files) == 0:
+    valid_mask_files = []
+    for img_path in img_files:
+        fname = os.path.basename(img_path)
+        stem  = fname.replace('_leftImg8bit.png', '')
+        city  = stem.split('_')[0]
+        mask_fname = f'{stem}_gtFine_labelIds.png'
+        mask_path  = os.path.join(mask_root, city, mask_fname)
+        if os.path.isfile(mask_path):
+            valid_mask_files.append(mask_path)
+        else:
+            mask_path_flat = os.path.join(mask_root, mask_fname)
+            if os.path.isfile(mask_path_flat):
+                valid_mask_files.append(mask_path_flat)
+            # 找不到对应标签则跳过（与 CityscapesDataset 行为一致）
+
+    if len(valid_mask_files) == 0:
         raise RuntimeError(
-            f"在 {mask_root} 下未找到任何 *_gtFine_labelIds.png 文件。"
+            f"在 {mask_root} 下未找到任何有效的图像-标签对。"
         )
 
-    print(f"  [Partition] 正在提取 {len(mask_files)} 张 Cityscapes 掩码的主类别"
+    # --- 检查缓存是否与当前数据集大小一致 ---
+    if cache and os.path.exists(cache_path):
+        labels = np.load(cache_path)
+        if len(labels) == len(valid_mask_files):
+            print(f"  [Partition] 加载 Cityscapes 主类别缓存: {cache_path}  ({len(labels)} 张)")
+            return labels
+        else:
+            print(f"  [Partition] 缓存大小不匹配（缓存 {len(labels)} 张 vs 数据集 {len(valid_mask_files)} 张），"
+                  f"重新生成缓存...")
+
+    print(f"  [Partition] 正在提取 {len(valid_mask_files)} 张 Cityscapes 掩码的主类别"
           f"（首次运行，约需 1~3 分钟）...")
 
     labels = []
-    for i, fpath in enumerate(mask_files):
+    for i, fpath in enumerate(valid_mask_files):
         dom = get_dominant_class_cityscapes(fpath, num_classes, target_size)
         labels.append(dom)
         if (i + 1) % 200 == 0:
-            print(f"    已处理 {i + 1}/{len(mask_files)} 张...")
+            print(f"    已处理 {i + 1}/{len(valid_mask_files)} 张...")
 
     labels = np.array(labels, dtype=np.int64)
 
