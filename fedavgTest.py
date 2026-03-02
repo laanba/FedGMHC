@@ -2,13 +2,24 @@
 fedavgTest.py — 联邦平均算法（含客户端聚合前验证）
 
 与 Fedavg.py 的核心区别：
-  在每一轮服务端聚合 **之前**，对每一个客户端完成本地训练后的模型
-  单独在验证集上进行评估，将每个客户端的验证结果（Pixel Accuracy、mIoU）
-  按轮次打包保存到 datasave/ 文件夹中：
-    - datasave/client_val_results.csv   ：所有轮次、所有客户端的完整验证记录
-    - datasave/round_{r}/client_{i}.json：每轮每客户端的详细验证数据（JSON 格式）
-    - datasave/pixel_accuracy_clients.png：各客户端 Pixel Accuracy 随轮次变化曲线
-    - datasave/miou_clients.png          ：各客户端 mIoU 随轮次变化曲线
+  1. 在每一轮服务端聚合 **之前**，对每一个客户端完成本地训练后的模型
+     单独在验证集上进行评估，记录 Pixel Accuracy、mIoU 及各类别 IoU。
+  2. 每次运行时，所有输出（客户端验证数据 + 全局模型图表）统一保存在
+     以 **月日时分** 编号的子文件夹中：
+
+       result_save/
+       └── MMDDHHmm/                       ← 本次运行根目录（如 03021435）
+           ├── datasave/                   ← 客户端聚合前验证数据
+           │   ├── client_val_results.csv  ← 所有轮次所有客户端汇总表（每轮实时更新）
+           │   ├── round_1/
+           │   │   ├── client_0.json
+           │   │   └── ...
+           │   ├── round_2/ ...
+           │   ├── pixel_accuracy_clients.png
+           │   └── miou_clients.png
+           ├── pixel_accuracy.png          ← 全局模型 Pixel Accuracy 曲线
+           ├── miou.png                    ← 全局模型 mIoU 曲线
+           └── results.csv                 ← 全局模型验证汇总表
 """
 
 import torch
@@ -26,6 +37,7 @@ import sys
 import time
 import csv
 import numpy as np
+from datetime import datetime
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -122,7 +134,6 @@ def evaluate_model(model, val_loader, device, use_amp=True):
     total_pixel_acc = 0.0
     total_miou = 0.0
     num_samples = 0
-    # 累计每类 IoU（用于计算平均每类 IoU）
     class_iou_sum = [0.0] * NUM_CLASSES
     class_iou_cnt = [0] * NUM_CLASSES
 
@@ -165,7 +176,7 @@ def save_client_val_data(round_idx, client_id, pixel_acc, miou, per_class_iou,
     """
     将单个客户端的验证数据保存为 JSON 文件。
 
-    文件路径：datasave/round_{round}/client_{client_id}.json
+    文件路径：<datasave_dir>/round_{round}/client_{client_id}.json
     """
     round_dir = os.path.join(datasave_dir, f'round_{round_idx + 1}')
     os.makedirs(round_dir, exist_ok=True)
@@ -192,7 +203,7 @@ def save_client_val_data(round_idx, client_id, pixel_acc, miou, per_class_iou,
 
 def save_all_client_csv(client_history, datasave_dir):
     """
-    将所有轮次、所有客户端的验证记录汇总保存为 CSV 文件。
+    将所有轮次、所有客户端的验证记录汇总保存为 CSV 文件（每轮实时更新）。
 
     列：Round, Client, Num_Samples, Pixel_Accuracy, mIoU, Train_Loss
     """
@@ -217,7 +228,6 @@ def save_client_curves(client_history, num_clients, datasave_dir):
     """
     绘制并保存各客户端 Pixel Accuracy 和 mIoU 随轮次变化的曲线图。
     """
-    # 按客户端整理数据
     client_data = {i: {'rounds': [], 'pixel_acc': [], 'miou': []}
                    for i in range(num_clients)}
     for record in client_history:
@@ -271,16 +281,13 @@ def save_client_curves(client_history, num_clients, datasave_dir):
 
 # ==================== 全局验证结果保存 ====================
 
-def save_global_results(history, save_dir):
+def save_global_results(history, run_dir):
     """
-    保存全局模型（聚合后）的实验结果：两张图 + 一张表
-
-    1. pixel_accuracy.png  - 像素准确率随训练轮次变化曲线
-    2. miou.png            - mIoU 随训练轮次变化曲线
-    3. results.csv         - 训练轮次、像素准确率、mIoU 的完整表格
+    保存全局模型（聚合后）的实验结果到本次运行根目录：
+      - pixel_accuracy.png
+      - miou.png
+      - results.csv
     """
-    os.makedirs(save_dir, exist_ok=True)
-
     rounds = [h['round'] for h in history]
     pixel_accs = [h['pixel_acc'] for h in history]
     mious = [h['miou'] for h in history]
@@ -294,7 +301,7 @@ def save_global_results(history, save_dir):
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend(fontsize=12)
     plt.tight_layout()
-    pa_path = os.path.join(save_dir, 'pixel_accuracy.png')
+    pa_path = os.path.join(run_dir, 'pixel_accuracy.png')
     plt.savefig(pa_path, dpi=150)
     plt.close()
     print(f"  已保存: {pa_path}")
@@ -308,13 +315,13 @@ def save_global_results(history, save_dir):
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend(fontsize=12)
     plt.tight_layout()
-    miou_path = os.path.join(save_dir, 'miou.png')
+    miou_path = os.path.join(run_dir, 'miou.png')
     plt.savefig(miou_path, dpi=150)
     plt.close()
     print(f"  已保存: {miou_path}")
 
     # ===== 表: results.csv =====
-    csv_path = os.path.join(save_dir, 'results.csv')
+    csv_path = os.path.join(run_dir, 'results.csv')
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['Round', 'Pixel Accuracy', 'mIoU'])
@@ -430,6 +437,13 @@ def main():
     BATCH_SIZE = 0  # 0 = 自动推荐
     # ================================================
 
+    # ===== 生成本次运行的时间戳目录（月日时分，格式 MMDDHHmm） =====
+    run_timestamp = datetime.now().strftime('%m%d%H%M')
+    run_dir = os.path.join('./result_save', run_timestamp)
+    datasave_dir = os.path.join(run_dir, 'datasave')
+    os.makedirs(datasave_dir, exist_ok=True)
+    print(f"\n本次运行结果将保存至: {run_dir}/")
+
     # ===== 1. 加载数据集 =====
     train_dataset = CamVidDataset('./data', split='train',
                                   transform=transforms.ToTensor(),
@@ -474,16 +488,9 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
                             num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
 
-    # ===== 3. 创建保存目录 =====
+    # ===== 3. 创建模型检查点目录 =====
     save_dir = './checkpoints'
     os.makedirs(save_dir, exist_ok=True)
-
-    result_dir = './result_save'
-    os.makedirs(result_dir, exist_ok=True)
-
-    # ===== datasave 目录（客户端聚合前验证数据） =====
-    datasave_dir = './datasave'
-    os.makedirs(datasave_dir, exist_ok=True)
 
     # ===== 4. 显存基线 =====
     if torch.cuda.is_available():
@@ -541,8 +548,8 @@ def main():
             print(f"  [Client {i}] Loss: {avg_loss:.4f} | "
                   f"Val Pixel Acc: {pixel_acc:.4f} | Val mIoU: {miou:.4f}")
 
-            # 保存单个客户端 JSON
-            json_path = save_client_val_data(
+            # 保存单个客户端 JSON（存入 run_dir/datasave/）
+            save_client_val_data(
                 round_idx=round_idx,
                 client_id=i,
                 pixel_acc=pixel_acc,
@@ -637,15 +644,14 @@ def main():
         'final_miou': history[-1]['miou'],
     }, final_path)
 
-    # ===== 7. 保存客户端验证曲线图 =====
+    # ===== 7. 保存客户端验证曲线图（存入 run_dir/datasave/） =====
     print(f"\n{'='*60}")
     print(f"正在生成客户端验证曲线图...")
     save_client_curves(client_history, NUM_CLIENTS, datasave_dir)
 
-    # ===== 8. 生成全局模型实验结果图表 =====
+    # ===== 8. 生成全局模型实验结果图表（存入 run_dir/） =====
     print(f"\n正在生成全局模型实验结果图表...")
-    save_global_results(history, result_dir)
-    print(f"全局结果已保存到: {result_dir}/")
+    save_global_results(history, run_dir)
     print(f"{'='*60}")
 
     # ===== 9. 打印训练总结 =====
@@ -677,8 +683,15 @@ def main():
     print(f"\n最优 mIoU: {best_miou:.4f}")
     print(f"最优模型: {os.path.join(save_dir, 'best_model.pth')}")
     print(f"最终模型: {final_path}")
-    print(f"全局结果: {result_dir}/")
-    print(f"客户端验证数据: {datasave_dir}/")
+    print(f"\n本次运行所有结果已保存至: {run_dir}/")
+    print(f"  ├── datasave/                  ← 客户端聚合前验证数据")
+    print(f"  │   ├── client_val_results.csv")
+    print(f"  │   ├── round_*/client_*.json")
+    print(f"  │   ├── pixel_accuracy_clients.png")
+    print(f"  │   └── miou_clients.png")
+    print(f"  ├── pixel_accuracy.png         ← 全局模型曲线")
+    print(f"  ├── miou.png")
+    print(f"  └── results.csv")
 
 
 if __name__ == "__main__":
