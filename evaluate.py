@@ -18,7 +18,7 @@ from PIL import Image
 from torchvision import transforms
 import matplotlib.pyplot as plt
 
-from demo import MobileNetV2UNet
+from model import MobileNetV2UNet
 
 # ===== CamVid 12 类 RGB 颜色映射表（与 Fedavg.py 保持一致） =====
 CAMVID_COLORS = np.array([

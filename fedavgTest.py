@@ -1,6 +1,20 @@
+"""
+fedavgTest.py — 联邦平均算法（含客户端聚合前验证）
+
+与 Fedavg.py 的核心区别：
+  在每一轮服务端聚合 **之前**，对每一个客户端完成本地训练后的模型
+  单独在验证集上进行评估，将每个客户端的验证结果（Pixel Accuracy、mIoU）
+  按轮次打包保存到 datasave/ 文件夹中：
+    - datasave/client_val_results.csv   ：所有轮次、所有客户端的完整验证记录
+    - datasave/round_{r}/client_{i}.json：每轮每客户端的详细验证数据（JSON 格式）
+    - datasave/pixel_accuracy_clients.png：各客户端 Pixel Accuracy 随轮次变化曲线
+    - datasave/miou_clients.png          ：各客户端 mIoU 随轮次变化曲线
+"""
+
 import torch
 import torch.nn.functional as F
 import copy
+import json
 from torch.utils.data import DataLoader, Subset
 from torch.cuda.amp import autocast, GradScaler
 
@@ -13,7 +27,7 @@ import time
 import csv
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # 无 GUI 环境下也能生成图片
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
@@ -23,12 +37,10 @@ def get_gpu_memory_info(device):
     """获取 GPU 显存信息（单位：MB）"""
     if not torch.cuda.is_available():
         return None
-
     allocated = torch.cuda.memory_allocated(device) / 1024 ** 2
     cached = torch.cuda.memory_reserved(device) / 1024 ** 2
     total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
     free = total - cached
-
     return {
         'allocated_mb': allocated,
         'cached_mb': cached,
@@ -54,7 +66,6 @@ def print_gpu_status(device, label=""):
 def auto_batch_size(device, num_data_per_client, base_batch_size=32):
     """根据 GPU 显存和每个客户端的数据量，智能推荐 batch_size。"""
     data_limit = max(8, num_data_per_client // 2)
-
     if torch.cuda.is_available():
         total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
         available = total - 500
@@ -64,14 +75,11 @@ def auto_batch_size(device, num_data_per_client, base_batch_size=32):
         gpu_limit = max(8, gpu_limit)
     else:
         gpu_limit = base_batch_size
-
     recommended = min(data_limit, gpu_limit)
-
     power = 1
     while power * 2 <= recommended:
         power *= 2
     recommended = max(4, power)
-
     return recommended
 
 
@@ -109,41 +117,163 @@ def compute_miou(pred, target, num_classes):
 # ==================== 验证函数 ====================
 
 def evaluate_model(model, val_loader, device, use_amp=True):
-    """在验证集上评估模型"""
+    """在验证集上评估模型，返回 (pixel_acc, miou, per_class_iou)"""
     model.eval()
     total_pixel_acc = 0.0
     total_miou = 0.0
     num_samples = 0
+    # 累计每类 IoU（用于计算平均每类 IoU）
+    class_iou_sum = [0.0] * NUM_CLASSES
+    class_iou_cnt = [0] * NUM_CLASSES
 
     with torch.no_grad():
         for images, labels in val_loader:
             images = images.to(device)
             labels = labels.to(device)
-
             with autocast(enabled=use_amp and torch.cuda.is_available()):
                 output = model(images)
-
             preds = output.argmax(dim=1)
-
             for i in range(preds.size(0)):
                 pixel_acc = compute_pixel_accuracy(preds[i], labels[i])
-                miou = compute_miou(preds[i], labels[i], NUM_CLASSES)
+                ious = compute_iou_per_class(preds[i], labels[i], NUM_CLASSES)
+                miou = np.nanmean([v for v in ious if not np.isnan(v)]) if any(
+                    not np.isnan(v) for v in ious) else 0.0
                 total_pixel_acc += pixel_acc
                 total_miou += miou
                 num_samples += 1
+                for cls in range(NUM_CLASSES):
+                    if not np.isnan(ious[cls]):
+                        class_iou_sum[cls] += ious[cls]
+                        class_iou_cnt[cls] += 1
 
     avg_pixel_acc = total_pixel_acc / num_samples if num_samples > 0 else 0.0
     avg_miou = total_miou / num_samples if num_samples > 0 else 0.0
+    per_class_iou = {
+        CLASS_NAMES[cls]: (class_iou_sum[cls] / class_iou_cnt[cls]
+                           if class_iou_cnt[cls] > 0 else None)
+        for cls in range(NUM_CLASSES)
+    }
 
     model.train()
-    return avg_pixel_acc, avg_miou
+    return avg_pixel_acc, avg_miou, per_class_iou
 
 
-# ==================== 结果保存 ====================
+# ==================== 客户端验证数据保存 ====================
 
-def save_results(history, save_dir):
+def save_client_val_data(round_idx, client_id, pixel_acc, miou, per_class_iou,
+                         loss, num_samples, datasave_dir):
     """
-    保存实验结果：两张图 + 一张表
+    将单个客户端的验证数据保存为 JSON 文件。
+
+    文件路径：datasave/round_{round}/client_{client_id}.json
+    """
+    round_dir = os.path.join(datasave_dir, f'round_{round_idx + 1}')
+    os.makedirs(round_dir, exist_ok=True)
+
+    data = {
+        'round': round_idx + 1,
+        'client_id': client_id,
+        'num_train_samples': num_samples,
+        'pixel_accuracy': round(pixel_acc, 6),
+        'miou': round(miou, 6),
+        'per_class_iou': {
+            cls: (round(v, 6) if v is not None else None)
+            for cls, v in per_class_iou.items()
+        },
+        'train_loss': round(loss, 6),
+    }
+
+    json_path = os.path.join(round_dir, f'client_{client_id}.json')
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    return json_path
+
+
+def save_all_client_csv(client_history, datasave_dir):
+    """
+    将所有轮次、所有客户端的验证记录汇总保存为 CSV 文件。
+
+    列：Round, Client, Num_Samples, Pixel_Accuracy, mIoU, Train_Loss
+    """
+    csv_path = os.path.join(datasave_dir, 'client_val_results.csv')
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Round', 'Client', 'Num_Samples',
+                         'Pixel_Accuracy', 'mIoU', 'Train_Loss'])
+        for record in client_history:
+            writer.writerow([
+                record['round'],
+                record['client_id'],
+                record['num_train_samples'],
+                f"{record['pixel_accuracy']:.6f}",
+                f"{record['miou']:.6f}",
+                f"{record['train_loss']:.6f}",
+            ])
+    return csv_path
+
+
+def save_client_curves(client_history, num_clients, datasave_dir):
+    """
+    绘制并保存各客户端 Pixel Accuracy 和 mIoU 随轮次变化的曲线图。
+    """
+    # 按客户端整理数据
+    client_data = {i: {'rounds': [], 'pixel_acc': [], 'miou': []}
+                   for i in range(num_clients)}
+    for record in client_history:
+        cid = record['client_id']
+        client_data[cid]['rounds'].append(record['round'])
+        client_data[cid]['pixel_acc'].append(record['pixel_accuracy'])
+        client_data[cid]['miou'].append(record['miou'])
+
+    colors = plt.cm.tab10.colors
+
+    # ===== Pixel Accuracy 曲线 =====
+    plt.figure(figsize=(12, 6))
+    for i in range(num_clients):
+        d = client_data[i]
+        if d['rounds']:
+            plt.plot(d['rounds'], d['pixel_acc'],
+                     marker='o', linewidth=1.5, markersize=3,
+                     color=colors[i % len(colors)],
+                     label=f'Client {i}')
+    plt.xlabel('Communication Round', fontsize=13)
+    plt.ylabel('Pixel Accuracy', fontsize=13)
+    plt.title('Per-Client Pixel Accuracy Before Aggregation', fontsize=15)
+    plt.legend(fontsize=10, loc='lower right')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    pa_path = os.path.join(datasave_dir, 'pixel_accuracy_clients.png')
+    plt.savefig(pa_path, dpi=150)
+    plt.close()
+    print(f"  已保存: {pa_path}")
+
+    # ===== mIoU 曲线 =====
+    plt.figure(figsize=(12, 6))
+    for i in range(num_clients):
+        d = client_data[i]
+        if d['rounds']:
+            plt.plot(d['rounds'], d['miou'],
+                     marker='s', linewidth=1.5, markersize=3,
+                     color=colors[i % len(colors)],
+                     label=f'Client {i}')
+    plt.xlabel('Communication Round', fontsize=13)
+    plt.ylabel('mIoU', fontsize=13)
+    plt.title('Per-Client mIoU Before Aggregation', fontsize=15)
+    plt.legend(fontsize=10, loc='lower right')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    miou_path = os.path.join(datasave_dir, 'miou_clients.png')
+    plt.savefig(miou_path, dpi=150)
+    plt.close()
+    print(f"  已保存: {miou_path}")
+
+
+# ==================== 全局验证结果保存 ====================
+
+def save_global_results(history, save_dir):
+    """
+    保存全局模型（聚合后）的实验结果：两张图 + 一张表
 
     1. pixel_accuracy.png  - 像素准确率随训练轮次变化曲线
     2. miou.png            - mIoU 随训练轮次变化曲线
@@ -160,7 +290,7 @@ def save_results(history, save_dir):
     plt.plot(rounds, pixel_accs, 'b-o', linewidth=2, markersize=4, label='Pixel Accuracy')
     plt.xlabel('Communication Round', fontsize=14)
     plt.ylabel('Pixel Accuracy', fontsize=14)
-    plt.title('Pixel Accuracy vs. Communication Round', fontsize=16)
+    plt.title('Global Model Pixel Accuracy vs. Communication Round', fontsize=16)
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend(fontsize=12)
     plt.tight_layout()
@@ -174,7 +304,7 @@ def save_results(history, save_dir):
     plt.plot(rounds, mious, 'r-s', linewidth=2, markersize=4, label='mIoU')
     plt.xlabel('Communication Round', fontsize=14)
     plt.ylabel('mIoU', fontsize=14)
-    plt.title('mIoU vs. Communication Round', fontsize=16)
+    plt.title('Global Model mIoU vs. Communication Round', fontsize=16)
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend(fontsize=12)
     plt.tight_layout()
@@ -204,7 +334,8 @@ class Client:
         self.dataset = dataset
         self.indices = indices
 
-    def local_train(self, model, batch_size=32, epochs=1, lr=0.01, num_workers=0, pin_memory=False):
+    def local_train(self, model, batch_size=32, epochs=1, lr=0.01,
+                    num_workers=0, pin_memory=False):
         """本地训练"""
         self.train_loader = DataLoader(
             Subset(self.dataset, self.indices),
@@ -220,7 +351,6 @@ class Client:
         model.to(self.device)
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
         criterion = torch.nn.CrossEntropyLoss()
-
         scaler = GradScaler(enabled=self.use_amp)
 
         epoch_losses = []
@@ -230,20 +360,15 @@ class Client:
             for images, labels in self.train_loader:
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
-
                 optimizer.zero_grad(set_to_none=True)
-
                 with autocast(enabled=self.use_amp):
                     output = model(images)
                     loss = criterion(output, labels)
-
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-
                 running_loss += loss.item()
                 num_batches += 1
-
             epoch_losses.append(running_loss / max(num_batches, 1))
 
         avg_loss = np.mean(epoch_losses)
@@ -274,13 +399,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
-    # ===== GPU 信息 =====
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(device)
         total_mem = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
         print(f"GPU 型号: {gpu_name}")
         print(f"GPU 总显存: {total_mem:.0f} MB")
-
         torch.backends.cudnn.benchmark = True
         print("cuDNN benchmark: 已启用")
     else:
@@ -307,9 +430,13 @@ def main():
     BATCH_SIZE = 0  # 0 = 自动推荐
     # ================================================
 
-    # ===== 1. 加载数据集（从 dataset.py 导入） =====
-    train_dataset = CamVidDataset('./data', split='train', transform=transforms.ToTensor(), target_size=TARGET_SIZE)
-    val_dataset = CamVidDataset('./data', split='val', transform=transforms.ToTensor(), target_size=TARGET_SIZE)
+    # ===== 1. 加载数据集 =====
+    train_dataset = CamVidDataset('./data', split='train',
+                                  transform=transforms.ToTensor(),
+                                  target_size=TARGET_SIZE)
+    val_dataset = CamVidDataset('./data', split='val',
+                                transform=transforms.ToTensor(),
+                                target_size=TARGET_SIZE)
 
     num_images = len(train_dataset)
     indices = np.arange(num_images)
@@ -354,17 +481,22 @@ def main():
     result_dir = './result_save'
     os.makedirs(result_dir, exist_ok=True)
 
+    # ===== datasave 目录（客户端聚合前验证数据） =====
+    datasave_dir = './datasave'
+    os.makedirs(datasave_dir, exist_ok=True)
+
     # ===== 4. 显存基线 =====
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
     print_gpu_status(device, "训练前基线")
 
     # ===== 5. 训练循环 =====
-    history = []
+    history = []          # 全局模型（聚合后）验证历史
+    client_history = []   # 所有客户端聚合前验证历史（用于汇总 CSV）
     best_miou = 0.0
 
     print(f"\n{'='*80}")
-    print(f"开始联邦训练...")
+    print(f"开始联邦训练（含客户端聚合前验证）...")
     print(f"{'='*80}")
 
     total_train_time = 0.0
@@ -377,6 +509,7 @@ def main():
         local_lens = []
         round_losses = []
 
+        # ===== 每个客户端：本地训练 → 聚合前验证 → 收集权重 =====
         for i in range(NUM_CLIENTS):
             client = Client(i, train_dataset, user_groups[i], device, use_amp=USE_AMP)
             local_model = copy.deepcopy(global_model)
@@ -384,6 +517,7 @@ def main():
             if i == 0 and round_idx == 0 and torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(device)
 
+            # --- 本地训练 ---
             weights, avg_loss = client.local_train(
                 local_model,
                 batch_size=BATCH_SIZE,
@@ -396,7 +530,38 @@ def main():
             if i == 0 and round_idx == 0 and torch.cuda.is_available():
                 train_peak = torch.cuda.max_memory_allocated(device) / 1024 ** 2
                 total_gpu = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
-                print(f"  [训练时峰值显存] {train_peak:.0f}MB / {total_gpu:.0f}MB ({train_peak/total_gpu*100:.1f}%)")
+                print(f"  [训练时峰值显存] {train_peak:.0f}MB / {total_gpu:.0f}MB "
+                      f"({train_peak/total_gpu*100:.1f}%)")
+
+            # --- 聚合前：在验证集上评估该客户端本地模型 ---
+            local_model.load_state_dict(weights)
+            pixel_acc, miou, per_class_iou = evaluate_model(
+                local_model, val_loader, device, use_amp=USE_AMP
+            )
+            print(f"  [Client {i}] Loss: {avg_loss:.4f} | "
+                  f"Val Pixel Acc: {pixel_acc:.4f} | Val mIoU: {miou:.4f}")
+
+            # 保存单个客户端 JSON
+            json_path = save_client_val_data(
+                round_idx=round_idx,
+                client_id=i,
+                pixel_acc=pixel_acc,
+                miou=miou,
+                per_class_iou=per_class_iou,
+                loss=avg_loss,
+                num_samples=len(user_groups[i]),
+                datasave_dir=datasave_dir
+            )
+
+            # 追加到汇总列表
+            client_history.append({
+                'round': round_idx + 1,
+                'client_id': i,
+                'num_train_samples': len(user_groups[i]),
+                'pixel_accuracy': pixel_acc,
+                'miou': miou,
+                'train_loss': avg_loss,
+            })
 
             local_weights.append(weights)
             local_lens.append(len(user_groups[i]))
@@ -418,8 +583,8 @@ def main():
         round_time = time.time() - round_start
         total_train_time += round_time
 
-        # ----- 每轮验证 -----
-        pixel_acc, miou = evaluate_model(global_model, val_loader, device, use_amp=USE_AMP)
+        # ----- 每轮全局模型验证（聚合后） -----
+        pixel_acc, miou, _ = evaluate_model(global_model, val_loader, device, use_amp=USE_AMP)
         history.append({
             'round': round_idx + 1,
             'pixel_acc': pixel_acc,
@@ -428,7 +593,9 @@ def main():
             'time': round_time
         })
 
-        print(f"  Loss: {avg_round_loss:.4f} | Pixel Acc: {pixel_acc:.4f} | mIoU: {miou:.4f} | 耗时: {round_time:.1f}s", end="")
+        print(f"  [Global] Loss: {avg_round_loss:.4f} | "
+              f"Pixel Acc: {pixel_acc:.4f} | mIoU: {miou:.4f} | 耗时: {round_time:.1f}s",
+              end="")
 
         # ----- 保存最优模型 -----
         if miou > best_miou:
@@ -457,6 +624,9 @@ def main():
             }, ckpt_path)
             print(f"  >> 检查点已保存: {ckpt_path}")
 
+        # ----- 每轮更新汇总 CSV（实时写入，防止中途崩溃丢失数据） -----
+        save_all_client_csv(client_history, datasave_dir)
+
     # ===== 6. 保存最终模型 =====
     final_path = os.path.join(save_dir, 'global_model_final.pth')
     torch.save({
@@ -467,14 +637,18 @@ def main():
         'final_miou': history[-1]['miou'],
     }, final_path)
 
-    # ===== 7. 生成实验结果图表 =====
+    # ===== 7. 保存客户端验证曲线图 =====
     print(f"\n{'='*60}")
-    print(f"正在生成实验结果图表...")
-    save_results(history, result_dir)
-    print(f"所有结果已保存到: {result_dir}/")
+    print(f"正在生成客户端验证曲线图...")
+    save_client_curves(client_history, NUM_CLIENTS, datasave_dir)
+
+    # ===== 8. 生成全局模型实验结果图表 =====
+    print(f"\n正在生成全局模型实验结果图表...")
+    save_global_results(history, result_dir)
+    print(f"全局结果已保存到: {result_dir}/")
     print(f"{'='*60}")
 
-    # ===== 8. 打印训练总结 =====
+    # ===== 9. 打印训练总结 =====
     print(f"\n{'='*80}")
     print(f"训练完成！总结如下：")
     print(f"{'='*80}")
@@ -497,12 +671,14 @@ def main():
     print(f"\n{'Round':<8} {'Loss':<12} {'Pixel Acc':<14} {'mIoU':<14} {'耗时(s)':<10}")
     print(f"{'-'*58}")
     for h in history:
-        print(f"{h['round']:<8} {h['loss']:<12.4f} {h['pixel_acc']:<14.4f} {h['miou']:<14.4f} {h['time']:<10.1f}")
+        print(f"{h['round']:<8} {h['loss']:<12.4f} {h['pixel_acc']:<14.4f} "
+              f"{h['miou']:<14.4f} {h['time']:<10.1f}")
     print(f"{'-'*58}")
     print(f"\n最优 mIoU: {best_miou:.4f}")
     print(f"最优模型: {os.path.join(save_dir, 'best_model.pth')}")
     print(f"最终模型: {final_path}")
-    print(f"实验结果: {result_dir}/")
+    print(f"全局结果: {result_dir}/")
+    print(f"客户端验证数据: {datasave_dir}/")
 
 
 if __name__ == "__main__":

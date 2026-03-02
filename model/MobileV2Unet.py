@@ -1,3 +1,10 @@
+"""
+MobileNetV2-UNet 语义分割模型
+
+基于 MobileNetV2 作为 Encoder，结合 UNet 风格的 Decoder，
+适用于语义分割任务（如 CamVid 12 类分割）。
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
