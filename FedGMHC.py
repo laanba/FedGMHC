@@ -55,6 +55,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 from model import MobileNetV2UNet
 from dataset import CamVidDataset, NUM_CLASSES, CLASS_NAMES
+from partition import build_label_index, dirichlet_partition, print_partition_stats
 
 import os
 import sys
@@ -509,6 +510,8 @@ def main():
     NUM_WORKERS  = 0 if sys.platform == 'win32' else 4
     PIN_MEMORY   = True
     BATCH_SIZE   = 0        # 0 = 自动推荐
+    DIRICHLET_ALPHA = 1.0   # Dirichlet 浓度参数（越小异质性越强；推荐 0.5/1.0/2.0）
+    MIN_SAMPLES     = 20    # 每个客户端最少图像数量
     # ================================================
 
     # ===== 时间戳运行目录 =====
@@ -526,9 +529,15 @@ def main():
                                   target_size=TARGET_SIZE)
 
     num_images = len(train_dataset)
-    indices    = np.arange(num_images)
-    np.random.shuffle(indices)
-    user_groups = np.array_split(indices, NUM_CLIENTS)
+
+    # ===== Dirichlet Non-IID 数据划分 =====
+    print(f"\n  [Partition] 使用 Dirichlet(α={DIRICHLET_ALPHA}) Non-IID 划分...")
+    labels = build_label_index('./data', split='train', num_classes=NUM_CLASSES,
+                               target_size=TARGET_SIZE)
+    user_groups = dirichlet_partition(
+        num_clients=NUM_CLIENTS, labels=labels, num_classes=NUM_CLASSES,
+        alpha=DIRICHLET_ALPHA, min_samples=MIN_SAMPLES, seed=42)
+    print_partition_stats(user_groups, labels, NUM_CLASSES, CLASS_NAMES)
 
     min_data = min(len(g) for g in user_groups)
     if BATCH_SIZE == 0:
@@ -537,9 +546,9 @@ def main():
     print(f"\n{'='*65}")
     print(f"训练配置:")
     print(f"  训练集: {num_images} 张 | 验证集: {len(val_dataset)} 张")
-    print(f"  客户端: {NUM_CLIENTS} 个 | 簇数: {NUM_CLUSTERS}")
-    print(f"  热身轮数: {WARMUP_ROUNDS} | 重聚类间隔: "
-          f"{'禁用' if RECLUSTER_INTERVAL == 0 else f'每 {RECLUSTER_INTERVAL} 轮'}")
+    print(f"  客户端: {NUM_CLIENTS} 个 | 簇数: {NUM_CLUSTERS} | Dirichlet α={DIRICHLET_ALPHA} | 最少 {min_data} 张/客户端")
+    _recluster_str = '禁用' if RECLUSTER_INTERVAL == 0 else f'每 {RECLUSTER_INTERVAL} 轮'
+    print(f"  热身轮数: {WARMUP_ROUNDS} | 重聚类间隔: {_recluster_str}")
     print(f"  Batch Size: {BATCH_SIZE} | Local Epochs: {LOCAL_EPOCHS} | 联邦轮数: {NUM_ROUNDS}")
     print(f"  学习率: {LR} | AMP: {'已启用' if USE_AMP and torch.cuda.is_available() else '未启用'}")
     print(f"{'='*65}")
