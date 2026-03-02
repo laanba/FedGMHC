@@ -1,50 +1,20 @@
 import torch
 import torch.nn.functional as F
 import copy
-from torch.utils.data import DataLoader, Subset, Dataset
+from torch.utils.data import DataLoader, Subset
 from torch.cuda.amp import autocast, GradScaler
 
 from demo import MobileNetV2UNet
+from dataset import CamVidDataset, NUM_CLASSES, CLASS_NAMES
+
 import os
 import sys
 import time
-from PIL import Image
-from torch.utils.data import Dataset
+import csv
 import numpy as np
-
-# ===== CamVid 12 类 RGB 颜色映射表 =====
-CAMVID_COLORS = np.array([
-    [0,     0,   0],    # 0:  Void / Unlabelled
-    [0,     0, 192],    # 1:  Pavement
-    [0,   128, 192],    # 2:  Bicyclist
-    [64,    0, 128],    # 3:  Car
-    [64,   64,   0],    # 4:  Pedestrian
-    [64,   64, 128],    # 5:  Fence
-    [128,   0,   0],    # 6:  Building
-    [128,  64, 128],    # 7:  Road
-    [128, 128,   0],    # 8:  Tree
-    [128, 128, 128],    # 9:  Sky
-    [192, 128, 128],    # 10: SignSymbol / Pole
-    [192, 192, 128],    # 11: Column_Pole
-], dtype=np.uint8)
-
-CLASS_NAMES = [
-    'Void', 'Pavement', 'Bicyclist', 'Car', 'Pedestrian', 'Fence',
-    'Building', 'Road', 'Tree', 'Sky', 'SignSymbol', 'Column_Pole'
-]
-
-NUM_CLASSES = len(CAMVID_COLORS)  # 12
-
-
-def rgb_mask_to_class_index(mask_rgb, color_map=CAMVID_COLORS):
-    """将 RGB 掩码图转换为类别索引图"""
-    mask = np.array(mask_rgb)
-    h, w = mask.shape[:2]
-    class_mask = np.zeros((h, w), dtype=np.int64)
-    for cls_idx, color in enumerate(color_map):
-        match = np.all(mask == color, axis=-1)
-        class_mask[match] = cls_idx
-    return class_mask
+import matplotlib
+matplotlib.use('Agg')  # 无 GUI 环境下也能生成图片
+import matplotlib.pyplot as plt
 
 
 # ==================== 显存监控工具 ====================
@@ -82,33 +52,21 @@ def print_gpu_status(device, label=""):
 
 
 def auto_batch_size(device, num_data_per_client, base_batch_size=32):
-    """
-    根据 GPU 显存和每个客户端的数据量，智能推荐 batch_size。
-
-    核心原则：
-    - batch_size 不应超过单个客户端的数据量，否则每个 epoch 只有 1 步梯度更新，
-      训练严重不充分。
-    - batch_size 理想范围是客户端数据量的 1/3 ~ 1/2，确保每个 epoch 有 2~3 步更新。
-    - 同时不能超过 GPU 显存的承载能力。
-    """
-    # 1. 根据数据量确定上限：不超过客户端数据量的一半
+    """根据 GPU 显存和每个客户端的数据量，智能推荐 batch_size。"""
     data_limit = max(8, num_data_per_client // 2)
 
-    # 2. 根据 GPU 显存确定上限
     if torch.cuda.is_available():
         total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
-        available = total - 500  # 预留 500MB
-        per_sample_mb = 25  # AMP 模式下每个样本约 25MB
+        available = total - 500
+        per_sample_mb = 25
         fixed_overhead_mb = 200
         gpu_limit = int((available - fixed_overhead_mb) / per_sample_mb)
         gpu_limit = max(8, gpu_limit)
     else:
         gpu_limit = base_batch_size
 
-    # 3. 取两者中的较小值
     recommended = min(data_limit, gpu_limit)
 
-    # 4. 向下取到最近的 2 的幂次（方便 GPU 对齐），且不小于 4
     power = 1
     while power * 2 <= recommended:
         power *= 2
@@ -181,7 +139,61 @@ def evaluate_model(model, val_loader, device, use_amp=True):
     return avg_pixel_acc, avg_miou
 
 
-# ==================== 客户端 & 数据集 ====================
+# ==================== 结果保存 ====================
+
+def save_results(history, save_dir):
+    """
+    保存实验结果：两张图 + 一张表
+
+    1. pixel_accuracy.png  - 像素准确率随训练轮次变化曲线
+    2. miou.png            - mIoU 随训练轮次变化曲线
+    3. results.csv         - 训练轮次、像素准确率、mIoU 的完整表格
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    rounds = [h['round'] for h in history]
+    pixel_accs = [h['pixel_acc'] for h in history]
+    mious = [h['miou'] for h in history]
+
+    # ===== 图 1: Pixel Accuracy =====
+    plt.figure(figsize=(10, 6))
+    plt.plot(rounds, pixel_accs, 'b-o', linewidth=2, markersize=4, label='Pixel Accuracy')
+    plt.xlabel('Communication Round', fontsize=14)
+    plt.ylabel('Pixel Accuracy', fontsize=14)
+    plt.title('Pixel Accuracy vs. Communication Round', fontsize=16)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+    pa_path = os.path.join(save_dir, 'pixel_accuracy.png')
+    plt.savefig(pa_path, dpi=150)
+    plt.close()
+    print(f"  已保存: {pa_path}")
+
+    # ===== 图 2: mIoU =====
+    plt.figure(figsize=(10, 6))
+    plt.plot(rounds, mious, 'r-s', linewidth=2, markersize=4, label='mIoU')
+    plt.xlabel('Communication Round', fontsize=14)
+    plt.ylabel('mIoU', fontsize=14)
+    plt.title('mIoU vs. Communication Round', fontsize=16)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+    miou_path = os.path.join(save_dir, 'miou.png')
+    plt.savefig(miou_path, dpi=150)
+    plt.close()
+    print(f"  已保存: {miou_path}")
+
+    # ===== 表: results.csv =====
+    csv_path = os.path.join(save_dir, 'results.csv')
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Round', 'Pixel Accuracy', 'mIoU'])
+        for h in history:
+            writer.writerow([h['round'], f"{h['pixel_acc']:.6f}", f"{h['miou']:.6f}"])
+    print(f"  已保存: {csv_path}")
+
+
+# ==================== 客户端 ====================
 
 class Client:
     def __init__(self, client_id, dataset, indices, device, use_amp=True):
@@ -193,12 +205,7 @@ class Client:
         self.indices = indices
 
     def local_train(self, model, batch_size=32, epochs=1, lr=0.01, num_workers=0, pin_memory=False):
-        """
-        本地训练，包含以下加速优化：
-        1. AMP 混合精度训练 (FP16)
-        2. pin_memory 加速 CPU→GPU 数据传输
-        3. cudnn.benchmark 自动选择最优卷积算法
-        """
+        """本地训练"""
         self.train_loader = DataLoader(
             Subset(self.dataset, self.indices),
             batch_size=batch_size,
@@ -243,37 +250,6 @@ class Client:
         return model.state_dict(), avg_loss
 
 
-class CamVidDataset(Dataset):
-    def __init__(self, root_dir, split='train', transform=None, target_size=(256, 256)):
-        self.root_dir = root_dir
-        self.img_dir = os.path.join(root_dir, split)
-        self.mask_dir = os.path.join(root_dir, f'{split}_labels')
-        self.images = sorted(os.listdir(self.img_dir))
-        self.masks = sorted(os.listdir(self.mask_dir))
-        self.transform = transform
-        self.target_size = target_size
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        img_path = os.path.join(self.img_dir, self.images[idx])
-        mask_path = os.path.join(self.mask_dir, self.masks[idx])
-
-        image = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path).convert("RGB")
-
-        if self.target_size is not None:
-            image = image.resize((self.target_size[1], self.target_size[0]), Image.BILINEAR)
-            mask = mask.resize((self.target_size[1], self.target_size[0]), Image.NEAREST)
-
-        if self.transform:
-            image = self.transform(image)
-            mask = torch.from_numpy(rgb_mask_to_class_index(mask)).long()
-
-        return image, mask
-
-
 # ==================== 联邦聚合 ====================
 
 def federated_aggregate(global_model, client_weights, client_lens):
@@ -313,13 +289,11 @@ def main():
     from torchvision import transforms
 
     # ==================== 配置区 ====================
-    # 您可以根据自己的 GPU 显存大小和数据集规模调整以下参数
-
     USE_AMP = True            # 是否启用混合精度训练 (推荐开启)
     TARGET_SIZE = (256, 256)  # 输入图像尺寸
-    NUM_ROUNDS = 50           # 联邦训练轮数 (增加到 50 轮以确保充分收敛)
+    NUM_ROUNDS = 50           # 联邦训练轮数
     NUM_CLIENTS = 5           # 客户端数量
-    LOCAL_EPOCHS = 5          # 每个客户端的本地训练轮数 (增加到 5 轮以充分利用本地数据)
+    LOCAL_EPOCHS = 5          # 每个客户端的本地训练轮数
     LR = 0.01                 # 学习率
 
     # ★ Windows 多进程修复
@@ -330,12 +304,10 @@ def main():
         NUM_WORKERS = 4
         PIN_MEMORY = True
 
-    # BATCH_SIZE: 设为 0 表示自动推荐，或手动指定一个固定值 (如 16, 32)
     BATCH_SIZE = 0  # 0 = 自动推荐
-
     # ================================================
 
-    # ===== 1. 加载数据集（先加载，才能根据数据量推荐 batch_size） =====
+    # ===== 1. 加载数据集（从 dataset.py 导入） =====
     train_dataset = CamVidDataset('./data', split='train', transform=transforms.ToTensor(), target_size=TARGET_SIZE)
     val_dataset = CamVidDataset('./data', split='val', transform=transforms.ToTensor(), target_size=TARGET_SIZE)
 
@@ -344,7 +316,6 @@ def main():
     np.random.shuffle(indices)
     user_groups = np.array_split(indices, NUM_CLIENTS)
 
-    # 计算每个客户端的平均数据量
     avg_data_per_client = num_images // NUM_CLIENTS
     min_data_per_client = min(len(g) for g in user_groups)
 
@@ -380,6 +351,9 @@ def main():
     save_dir = './checkpoints'
     os.makedirs(save_dir, exist_ok=True)
 
+    result_dir = './result_save'
+    os.makedirs(result_dir, exist_ok=True)
+
     # ===== 4. 显存基线 =====
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
@@ -407,7 +381,6 @@ def main():
             client = Client(i, train_dataset, user_groups[i], device, use_amp=USE_AMP)
             local_model = copy.deepcopy(global_model)
 
-            # ★ 在第一个客户端训练时监控显存（此时 GPU 正在工作）
             if i == 0 and round_idx == 0 and torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(device)
 
@@ -420,7 +393,6 @@ def main():
                 pin_memory=PIN_MEMORY
             )
 
-            # ★ 在第一轮第一个客户端训练完成后立即打印训练时的峰值显存
             if i == 0 and round_idx == 0 and torch.cuda.is_available():
                 train_peak = torch.cuda.max_memory_allocated(device) / 1024 ** 2
                 total_gpu = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
@@ -495,12 +467,18 @@ def main():
         'final_miou': history[-1]['miou'],
     }, final_path)
 
-    # ===== 7. 打印训练总结 =====
+    # ===== 7. 生成实验结果图表 =====
+    print(f"\n{'='*60}")
+    print(f"正在生成实验结果图表...")
+    save_results(history, result_dir)
+    print(f"所有结果已保存到: {result_dir}/")
+    print(f"{'='*60}")
+
+    # ===== 8. 打印训练总结 =====
     print(f"\n{'='*80}")
     print(f"训练完成！总结如下：")
     print(f"{'='*80}")
 
-    # GPU 显存总结
     if torch.cuda.is_available():
         peak_mem = torch.cuda.max_memory_allocated(device) / 1024 ** 2
         total_mem = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
@@ -512,7 +490,6 @@ def main():
         print(f"  AMP 混合精度: {'已启用' if USE_AMP else '未启用'}")
         print(f"  Batch Size:   {BATCH_SIZE}")
 
-    # 性能总结
     print(f"\n[训练性能总结]")
     print(f"  总训练时间:   {total_train_time:.1f}s ({total_train_time / 60:.1f} min)")
     print(f"  平均每轮耗时: {total_train_time / NUM_ROUNDS:.1f}s")
@@ -525,6 +502,7 @@ def main():
     print(f"\n最优 mIoU: {best_miou:.4f}")
     print(f"最优模型: {os.path.join(save_dir, 'best_model.pth')}")
     print(f"最终模型: {final_path}")
+    print(f"实验结果: {result_dir}/")
 
 
 if __name__ == "__main__":
