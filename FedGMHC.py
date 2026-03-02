@@ -66,12 +66,17 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from sklearn.mixture import GaussianMixture
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 
 # ==================== 超参数 ====================
 NUM_CLUSTERS        = 3    # GMM 部件数 / 簇数
 WARMUP_ROUNDS       = 5    # 热身轮数：前 N 轮执行标准 FedAvg，之后再首次聚类
 RECLUSTER_INTERVAL  = 10   # 动态重聚类间隔：每隔 M 轮重新聚类一次（0 = 禁用重聚类）
+# PCA 目标维度：降维后的特征维度，需满足 PCA_N_COMPONENTS < min(NUM_CLIENTS, feat_dim)
+# 推荐范围：[NUM_CLUSTERS, NUM_CLIENTS - 1]，默认取 NUM_CLIENTS // 2
+PCA_N_COMPONENTS    = None  # None = 自动设置为 min(NUM_CLIENTS-1, 8)
 
 
 # ==================== 显存监控工具 ====================
@@ -176,7 +181,13 @@ def extract_bn_feature(state_dict):
 def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_dir,
                        cluster_log, prev_assignments=None):
     """
-    提取 BN 特征，拟合 GMM，分配客户端到簇。
+    提取 BN 特征 → 标准化 → PCA 降维 → 拟合 GMM → 分配客户端到簇。
+
+    高维 BN 特征（维度通常远大于客户端数）直接送入 GMM 会导致后验概率
+    退化为 0/1（硬分配），失去概率软分配的意义。
+    解决方案：先用 StandardScaler 标准化，再用 PCA 将特征压缩到
+    PCA_N_COMPONENTS 维（默认 min(N-1, 8)），使特征维度远小于客户端数，
+    从而让 GMM 的高斯分布保持合理的宽度，后验概率恢复为有意义的软分配。
 
     参数
     ----
@@ -192,28 +203,47 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
     ----
     new_assignments  : list[int]，新的客户端分簇结果
     changed          : bool，分配结果是否发生变化
-    posteriors       : ndarray (N, K)，后验概率矩阵
+    posteriors       : ndarray (N, K)，后验概率矩阵（基于降维后特征）
     """
     print(f"\n  [GMM] 提取 BN 层统计特征（Round {round_idx + 1}）...")
     features = [extract_bn_feature(w) for w in local_weights]
     feat_dim = features[0].shape[0]
-    print(f"  [GMM] 客户端特征向量维度: {feat_dim}")
+    print(f"  [GMM] 原始特征向量维度: {feat_dim}")
 
     X = np.stack(features, axis=0)   # (N, D)
-    effective_k = min(n_clusters, num_clients)
+    N = X.shape[0]
+    effective_k = min(n_clusters, N)
 
-    # 使用多次随机初始化取最优，提升稳定性
+    # ---- Step 1: 标准化（消除不同 BN 层数值尺度差异）----
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)   # (N, D)
+
+    # ---- Step 2: PCA 降维 ----
+    # 目标维度：需满足 n_components < min(N, D)
+    # 推荐设为 [n_clusters, N-1] 之间，默认取 min(N-1, 8)
+    n_components = PCA_N_COMPONENTS if PCA_N_COMPONENTS is not None \
+        else min(N - 1, 8)
+    n_components = max(effective_k, min(n_components, N - 1, feat_dim))
+
+    pca = PCA(n_components=n_components, random_state=42)
+    X_pca = pca.fit_transform(X_scaled)   # (N, n_components)
+
+    explained_var = pca.explained_variance_ratio_.sum() * 100
+    print(f"  [GMM] PCA 降维: {feat_dim} → {n_components} 维 "
+          f"（累计解释方差: {explained_var:.1f}%）")
+
+    # ---- Step 3: 拟合 GMM ----
     gmm = GaussianMixture(
         n_components=effective_k,
-        covariance_type='diag',
+        covariance_type='full',   # 降维后维度低，可用 full 协方差
         max_iter=300,
-        n_init=5,            # 多次随机初始化，选 BIC 最优
-        random_state=None,   # 不固定种子，让每次重聚类有机会探索不同解
+        n_init=10,                # 多次随机初始化，选对数似然最优
+        random_state=None,        # 不固定种子，每次重聚类可探索不同解
         reg_covar=1e-4,
     )
-    gmm.fit(X)
+    gmm.fit(X_pca)
 
-    posteriors       = gmm.predict_proba(X)           # (N, K)
+    posteriors       = gmm.predict_proba(X_pca)       # (N, K)
     new_assignments  = posteriors.argmax(axis=1).tolist()
 
     # 检测分配变化
@@ -237,13 +267,15 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
 
     # 追加到聚类日志
     cluster_log.append({
-        'round':        round_idx + 1,
-        'trigger':      'warmup_end' if prev_assignments is None else 'recluster',
-        'feature_dim':  int(feat_dim),
-        'assignments':  new_assignments,
-        'changed':      changed,
-        'posteriors':   posteriors.tolist(),
-        'cluster_members': {
+        'round':            round_idx + 1,
+        'trigger':          'warmup_end' if prev_assignments is None else 'recluster',
+        'feature_dim_raw':  int(feat_dim),
+        'feature_dim_pca':  int(n_components),
+        'pca_explained_var_pct': round(float(explained_var), 2),
+        'assignments':      new_assignments,
+        'changed':          changed,
+        'posteriors':       posteriors.tolist(),
+        'cluster_members':  {
             str(k): [i for i, c in enumerate(new_assignments) if c == k]
             for k in range(effective_k)
         },
