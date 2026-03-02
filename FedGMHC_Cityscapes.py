@@ -542,18 +542,19 @@ def main():
     DATASET_ROOT = r'E:\Autonomous Driving Dataset\Cityscapes dataset(10g)'
 
     USE_AMP      = True
-    # Cityscapes 原始分辨率为 1024×2048；推荐使用 (512, 1024) 保持宽高比
-    # 若显存不足，可降至 (256, 512)
-    TARGET_SIZE  = (512, 1024)
-    NUM_ROUNDS   = 50
-    NUM_CLIENTS  = 10
-    LOCAL_EPOCHS = 5
+    # Cityscapes 原始分辨率为 1024×2048；推荐使用 (512, 1024) 保持宽高比 1:2
+    # 4060 Ti 8GB 建议使用 (256, 512)，可用 BATCH_SIZE=4，速度与显存均衡
+    # 若租用 16GB+ 显卡（如 RTX 4080/4090），可改回 (512, 1024)，BATCH_SIZE=8~16
+    TARGET_SIZE  = (256, 512)
+    NUM_ROUNDS   = 100
+    NUM_CLIENTS  = 20
+    LOCAL_EPOCHS = 1        # 联邦学习标准设置；通过增加通信轮数补偿
     LR           = 0.01
     NUM_WORKERS  = 0 if sys.platform == 'win32' else 4
     PIN_MEMORY   = True
-    BATCH_SIZE   = 0        # 0 = 自动推荐（根据显存和数据量自动计算）
+    BATCH_SIZE   = 4        # 4060 Ti 8GB + 256×512 图像，AMP 下每张约 10MB，4张共 40MB
     DIRICHLET_ALPHA = 1.0   # Dirichlet 浓度参数（越小异质性越强；推荐 0.5/1.0/2.0）
-    MIN_SAMPLES     = 100   # 每个客户端最少图像数量（Cityscapes 共 2974 张，每人约 297 张）
+    MIN_SAMPLES     = 100   # 每个客户端最少图像数量（Cityscapes 共 2974 张，每人约 149 张）
     # ================================================
 
     # ===== 时间戳运行目录 =====
