@@ -10,8 +10,9 @@ FedGMHC.py — 基于高斯混合模型（GMM）分簇的联邦学习方法
 方案二  动态重聚类
         首次聚类后，每隔 RECLUSTER_INTERVAL 轮重新提取 BN 特征并
         重新拟合 GMM，让分簇结果随训练进程自我修正并逐渐稳定。
-        每次重聚类时，若分簇结果发生变化，簇模型会从全局模型重新初始化，
-        保证客户端切换簇后有一个干净的起点。
+        每次重聚类时，若分簇结果发生变化，对有新成员迁入的簇模型执行
+        插值融合（α × 全局模型 + (1-α) × 原簇模型），而非硬重置，
+        保证性能曲线平滑过渡，避免跳跃式下降。
 
 算法流程
 --------
@@ -74,6 +75,9 @@ from sklearn.preprocessing import StandardScaler
 NUM_CLUSTERS        = 3    # GMM 部件数 / 簇数
 WARMUP_ROUNDS       = 5    # 热身轮数：前 N 轮执行标准 FedAvg，之后再首次聚类
 RECLUSTER_INTERVAL  = 10   # 动态重聚类间隔：每隔 M 轮重新聚类一次（0 = 禁用重聚类）
+# 重聚类后簇模型融合比例：新簇模型 = α × 全局模型 + (1-α) × 当前簇模型
+# α=0 完全保留原簇模型；α=1 等同于硬重置；推荐 0.2~0.4
+RECLUSTER_ALPHA     = 0.3
 # PCA 目标维度：降维后的特征维度，需满足 PCA_N_COMPONENTS < min(NUM_CLIENTS, feat_dim)
 # 推荐范围：[NUM_CLUSTERS, NUM_CLIENTS - 1]，默认取 NUM_CLIENTS // 2
 PCA_N_COMPONENTS    = None  # None = 自动设置为 min(NUM_CLIENTS-1, 8)
@@ -288,6 +292,38 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
     print(f"  [GMM] 聚类日志已更新: {log_path}")
 
     return new_assignments, changed, posteriors
+
+
+# ==================== 模型插值融合 ====================
+
+def interpolate_models(cluster_model, global_model, alpha):
+    """
+    将簇模型与全局模型做加权插值：
+        新簇模型参数 = α × 全局模型参数 + (1 - α) × 当前簇模型参数
+
+    参数
+    ----
+    cluster_model : 当前簇模型（原地修改并返回）
+    global_model  : 全局模型（只读）
+    alpha         : 全局模型权重，范围 [0, 1]
+                    0 = 完全保留簇模型；1 = 等同于硬重置为全局模型
+
+    说明
+    ----
+    相比硬重置，插值融合保留了原簇积累的特定知识，同时向全局模型靠拢，
+    使重聚类后的性能曲线平滑过渡，避免跳跃式下降。
+    """
+    cluster_sd = cluster_model.state_dict()
+    global_sd  = global_model.state_dict()
+    blended    = {}
+    for key in cluster_sd:
+        # 仅对浮点参数做插值；整型参数（如 num_batches_tracked）直接取全局值
+        if cluster_sd[key].is_floating_point():
+            blended[key] = (1.0 - alpha) * cluster_sd[key] + alpha * global_sd[key]
+        else:
+            blended[key] = global_sd[key]
+    cluster_model.load_state_dict(blended)
+    return cluster_model
 
 
 # ==================== 联邦聚合 ====================
@@ -623,17 +659,18 @@ def main():
                     prev_assignments=client_cluster,
                 )
                 if changed:
-                    # 分配发生变化：将发生迁移的客户端所在新簇模型重置为全局模型，
-                    # 避免旧簇知识污染新分组
+                    # 分配发生变化：对有新成员迁入的簇，采用插值融合而非硬重置，
+                    # 避免性能曲线出现跳跃式下降。
+                    # 新簇模型 = RECLUSTER_ALPHA × 全局模型 + (1-RECLUSTER_ALPHA) × 当前簇模型
                     changed_clusters = set()
                     for i in range(NUM_CLIENTS):
                         if new_assignments[i] != client_cluster[i]:
                             changed_clusters.add(new_assignments[i])
                     for k in changed_clusters:
-                        cluster_models[k].load_state_dict(
-                            copy.deepcopy(global_model.state_dict())
-                        )
-                        print(f"  [GMM] Cluster {k} 模型已重置为全局模型（因有新成员加入）")
+                        interpolate_models(cluster_models[k], global_model, RECLUSTER_ALPHA)
+                        print(f"  [GMM] Cluster {k} 模型已插值融合 "
+                              f"(α={RECLUSTER_ALPHA}: {RECLUSTER_ALPHA:.0%} 全局 + "
+                              f"{1-RECLUSTER_ALPHA:.0%} 原簇，因有新成员加入)")
                 client_cluster     = new_assignments
                 last_cluster_round = round_idx
 
