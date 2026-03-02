@@ -555,6 +555,8 @@ def main():
     BATCH_SIZE   = 4        # 4060 Ti 8GB + 256×512 图像，AMP 下每张约 10MB，4张共 40MB
     DIRICHLET_ALPHA = 1.0   # Dirichlet 浓度参数（越小异质性越强；推荐 0.5/1.0/2.0）
     MIN_SAMPLES     = 100   # 每个客户端最少图像数量（Cityscapes 共 2974 张，每人约 149 张）
+    MAX_SAMPLES     = 200   # 每个客户端最多图像数量（限制数据量过多的客户端，加快每轮训练）
+                            # 设为 None 则不限制
     # ================================================
 
     # ===== 时间戳运行目录 =====
@@ -591,6 +593,18 @@ def main():
         num_clients=NUM_CLIENTS, labels=labels, num_classes=NUM_CLASSES,
         alpha=DIRICHLET_ALPHA, min_samples=MIN_SAMPLES, seed=42,
     )
+    # ===== 截断超出 MAX_SAMPLES 限制的客户端数据 =====
+    if MAX_SAMPLES is not None:
+        import random as _random
+        _random.seed(42)
+        clipped = 0
+        for i in range(len(user_groups)):
+            if len(user_groups[i]) > MAX_SAMPLES:
+                user_groups[i] = _random.sample(list(user_groups[i]), MAX_SAMPLES)
+                clipped += 1
+        if clipped > 0:
+            print(f"  [Partition] MAX_SAMPLES={MAX_SAMPLES}: {clipped} 个客户端数据被截断")
+
     print_partition_stats(user_groups, labels, NUM_CLASSES, CLASS_NAMES)
 
     min_data = min(len(g) for g in user_groups)
@@ -602,7 +616,9 @@ def main():
     print(f"  数据集根目录: {DATASET_ROOT}")
     print(f"  图像尺寸: {TARGET_SIZE[0]}×{TARGET_SIZE[1]}  |  训练类别: {NUM_CLASSES}  |  IGNORE_INDEX: {IGNORE_INDEX}")
     print(f"  训练集: {num_images} 张 | 验证集: {len(val_dataset)} 张")
-    print(f"  客户端: {NUM_CLIENTS} 个 | 簇数: {NUM_CLUSTERS} | Dirichlet α={DIRICHLET_ALPHA} | 最少 {min_data} 张/客户端")
+    max_data = max(len(g) for g in user_groups)
+    _max_str = f' | 最多 {MAX_SAMPLES} 张/客户端' if MAX_SAMPLES is not None else ''
+    print(f"  客户端: {NUM_CLIENTS} 个 | 簇数: {NUM_CLUSTERS} | Dirichlet α={DIRICHLET_ALPHA} | 最少 {min_data} 张{_max_str}")
     _recluster_str = '禁用' if RECLUSTER_INTERVAL == 0 else f'每 {RECLUSTER_INTERVAL} 轮'
     print(f"  热身轮数: {WARMUP_ROUNDS} | 重聚类间隔: {_recluster_str}")
     print(f"  Batch Size: {BATCH_SIZE} | Local Epochs: {LOCAL_EPOCHS} | 联邦轮数: {NUM_ROUNDS}")
