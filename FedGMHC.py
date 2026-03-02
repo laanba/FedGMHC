@@ -225,28 +225,81 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
 
     # ---- Step 2: PCA 降维 ----
     # 目标维度：需满足 n_components < min(N, D)
-    # 推荐设为 [n_clusters, N-1] 之间，默认取 min(N-1, 8)
-    n_components = PCA_N_COMPONENTS if PCA_N_COMPONENTS is not None \
-        else min(N - 1, 8)
+    # 为避免协方差奇异，将维度限制在 [n_clusters, min(N//2, 5)] 之间
+    # 维度越低，各样本对高斯分布的覆盖越充分，协方差矩阵越稳定
+    if PCA_N_COMPONENTS is not None:
+        n_components = PCA_N_COMPONENTS
+    else:
+        # 默认：min(N//2, 5)，但不小于簇数，不大于 N-1
+        n_components = min(N // 2, 5)
     n_components = max(effective_k, min(n_components, N - 1, feat_dim))
 
     pca = PCA(n_components=n_components, random_state=42)
-    X_pca = pca.fit_transform(X_scaled)   # (N, n_components)
+    # 强制 float64：避免 float32 导致协方差矩阵数値不稳定
+    X_pca = pca.fit_transform(X_scaled).astype(np.float64)
 
     explained_var = pca.explained_variance_ratio_.sum() * 100
     print(f"  [GMM] PCA 降维: {feat_dim} → {n_components} 维 "
           f"（累计解释方差: {explained_var:.1f}%）")
 
     # ---- Step 3: 拟合 GMM ----
-    gmm = GaussianMixture(
-        n_components=effective_k,
-        covariance_type='full',   # 降维后维度低，可用 full 协方差
-        max_iter=300,
-        n_init=10,                # 多次随机初始化，选对数似然最优
-        random_state=None,        # 不固定种子，每次重聚类可探索不同解
-        reg_covar=1e-4,
-    )
-    gmm.fit(X_pca)
+    # 使用 'diag' 协方差：在小样本场景下比 'full' 更稳定，不易出现奇异
+    # reg_covar 设为 1e-2，充分正则化协方差矩阵对角元素
+    def _fit_gmm(X_data, k, reg):
+        gmm = GaussianMixture(
+            n_components=k,
+            covariance_type='diag',
+            max_iter=300,
+            n_init=5,
+            random_state=None,
+            reg_covar=reg,
+        )
+        gmm.fit(X_data)
+        return gmm
+
+    # 逐步升高 reg_covar 直到成功，最多尝试 5 次
+    reg_list = [1e-2, 1e-1, 0.5, 1.0, 2.0]
+    gmm = None
+    for reg in reg_list:
+        try:
+            gmm = _fit_gmm(X_pca, effective_k, reg)
+            print(f"  [GMM] 拟合成功 (reg_covar={reg})")
+            break
+        except (ValueError, np.linalg.LinAlgError) as e:
+            print(f"  [GMM] reg_covar={reg} 拟合失败，尝试加大正则化系数... ({e})")
+    if gmm is None:
+        # 最后降级处理：用 KMeans 硬分配替代 GMM
+        print("  [GMM] 警告：GMM 全部失败，降级为 KMeans 硬分配")
+        from sklearn.cluster import KMeans
+        km = KMeans(n_clusters=effective_k, n_init=10, random_state=42)
+        km.fit(X_pca)
+        hard_labels = km.labels_
+        # 构造伪后验概率矩阵（硬分配）
+        posteriors = np.zeros((N, effective_k), dtype=np.float64)
+        posteriors[np.arange(N), hard_labels] = 1.0
+        new_assignments = hard_labels.tolist()
+        changed = (prev_assignments is None) or (new_assignments != prev_assignments)
+        print(f"  [GMM/KMeans 降级] 分簇结果: {new_assignments}")
+        # 跳过后续正常流程
+        cluster_log.append({
+            'round':            round_idx + 1,
+            'trigger':          'warmup_end' if prev_assignments is None else 'recluster',
+            'method':           'kmeans_fallback',
+            'feature_dim_raw':  int(feat_dim),
+            'feature_dim_pca':  int(n_components),
+            'pca_explained_var_pct': round(float(explained_var), 2),
+            'assignments':      new_assignments,
+            'changed':          changed,
+            'posteriors':       posteriors.tolist(),
+            'cluster_members':  {
+                str(k): [i for i, c in enumerate(new_assignments) if c == k]
+                for k in range(effective_k)
+            },
+        })
+        log_path = os.path.join(run_dir, 'gmm_cluster_log.json')
+        with open(log_path, 'w', encoding='utf-8') as f:
+            json.dump(cluster_log, f, ensure_ascii=False, indent=2)
+        return new_assignments, changed, posteriors
 
     posteriors       = gmm.predict_proba(X_pca)       # (N, K)
     new_assignments  = posteriors.argmax(axis=1).tolist()
