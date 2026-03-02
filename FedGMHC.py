@@ -445,7 +445,7 @@ def main():
 
     # ===== 时间戳运行目录 =====
     run_timestamp = datetime.now().strftime('%m%d%H%M')
-    run_dir = os.path.join('./result_save', run_timestamp)
+    run_dir = os.path.join('./result_save', f'FedGMHC_{run_timestamp}')
     os.makedirs(run_dir, exist_ok=True)
     print(f"\n本次运行结果将保存至: {run_dir}/")
 
