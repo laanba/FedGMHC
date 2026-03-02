@@ -1,32 +1,46 @@
 """
 FedGMHC.py — 基于高斯混合模型（GMM）分簇的联邦学习方法
 
+冷启动解决策略（组合方案）
+--------------------------
+方案一  延迟聚类（热身期）
+        前 WARMUP_ROUNDS 轮执行标准 FedAvg，等待模型收敛、BN 统计量
+        充分反映各客户端数据分布后，再进行首次 GMM 聚类。
+
+方案二  动态重聚类
+        首次聚类后，每隔 RECLUSTER_INTERVAL 轮重新提取 BN 特征并
+        重新拟合 GMM，让分簇结果随训练进程自我修正并逐渐稳定。
+        每次重聚类时，若分簇结果发生变化，簇模型会从全局模型重新初始化，
+        保证客户端切换簇后有一个干净的起点。
+
 算法流程
 --------
-阶段 0  初始化训练（第 1 轮）
-        所有客户端从同一全局模型出发，完成本地训练。
+热身期（Round 1 ~ WARMUP_ROUNDS）
+    所有客户端从全局模型出发，完成本地训练，执行标准 FedAvg 聚合。
+    每轮结束后，所有簇模型与全局模型保持同步。
 
-阶段 1  BN 特征提取与 GMM 聚类（仅在第 1 轮结束后执行一次）
-        1. 从每个客户端训练后的本地模型中提取所有 BatchNorm 层的
-           running_mean 和 running_var，拼接为客户端特征向量。
-        2. 对所有客户端特征向量拟合高斯混合模型（GMM，K=NUM_CLUSTERS 个部件）。
-        3. 计算每个客户端对各高斯部件的后验概率（responsibility），
-           取后验概率最大的部件编号作为该客户端所属簇。
+首次聚类（Round WARMUP_ROUNDS 结束后）
+    提取各客户端 BN 层 running_mean / running_var，
+    拼接为特征向量，拟合 GMM（K = NUM_CLUSTERS，对角协方差），
+    按后验概率最大值分配各客户端到对应簇。
 
-阶段 2  分簇联邦训练（第 2 轮起）
-        每轮：
-          a. 每个客户端从 **所属簇的簇模型** 出发，完成本地训练。
-          b. 同簇客户端按数据量加权聚合，更新各簇模型。
-          c. 所有簇模型按各簇总数据量加权聚合，更新全局模型。
-          d. 在验证集上分别评估每个簇模型和全局模型，记录结果。
+分簇训练期（Round WARMUP_ROUNDS+1 起）
+    每轮：
+      a. 每个客户端从所属簇模型出发，完成本地训练。
+      b. 同簇客户端按数据量加权 FedAvg，更新各簇模型。
+      c. 各簇模型按各簇总数据量加权 FedAvg，更新全局模型。
+      d. 若当前轮满足重聚类条件（距上次聚类已过 RECLUSTER_INTERVAL 轮），
+         重新提取 BN 特征并更新分簇结果。
+      e. 在验证集上分别评估每个簇模型和全局模型，记录结果。
 
 结果保存
 --------
 每次运行结果统一保存在 result_save/MMDDHHmm/ 子目录下：
   result_save/
   └── MMDDHHmm/
-      ├── cluster_val_results.csv    ← 每轮每簇验证数据汇总表
-      ├── global_val_results.csv     ← 每轮全局模型验证数据汇总表
+      ├── gmm_cluster_log.json       ← 每次聚类的详细记录（含轮次、分配、后验概率）
+      ├── cluster_val_results.csv    ← 每轮每簇验证数据汇总表（实时更新）
+      ├── global_val_results.csv     ← 每轮全局模型验证数据汇总表（实时更新）
       ├── pixel_accuracy.png         ← 各簇 + 全局 Pixel Accuracy 折线图
       └── miou.png                   ← 各簇 + 全局 mIoU 折线图
 """
@@ -55,7 +69,9 @@ from sklearn.mixture import GaussianMixture
 
 
 # ==================== 超参数 ====================
-NUM_CLUSTERS = 3   # GMM 部件数 / 簇数
+NUM_CLUSTERS        = 3    # GMM 部件数 / 簇数
+WARMUP_ROUNDS       = 5    # 热身轮数：前 N 轮执行标准 FedAvg，之后再首次聚类
+RECLUSTER_INTERVAL  = 10   # 动态重聚类间隔：每隔 M 轮重新聚类一次（0 = 禁用重聚类）
 
 
 # ==================== 显存监控工具 ====================
@@ -157,40 +173,95 @@ def extract_bn_feature(state_dict):
 
 # ==================== GMM 聚类 ====================
 
-def fit_gmm_and_assign(client_features, n_clusters=NUM_CLUSTERS, random_state=42):
+def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_dir,
+                       cluster_log, prev_assignments=None):
     """
-    用 GMM 对客户端特征向量聚类，返回：
-      - gmm        : 拟合好的 GaussianMixture 对象
-      - assignments: list[int]，每个客户端所属簇编号（0-based）
-      - posteriors : ndarray (N, K)，每个客户端对每个部件的后验概率
+    提取 BN 特征，拟合 GMM，分配客户端到簇。
+
+    参数
+    ----
+    local_weights    : 本轮各客户端训练后的 state_dict 列表
+    num_clients      : 客户端总数
+    n_clusters       : GMM 部件数
+    round_idx        : 当前轮次索引（0-based），用于日志
+    run_dir          : 结果保存目录
+    cluster_log      : 聚类日志列表（原地追加）
+    prev_assignments : 上一次的分配结果，用于检测分配变化
+
+    返回
+    ----
+    new_assignments  : list[int]，新的客户端分簇结果
+    changed          : bool，分配结果是否发生变化
+    posteriors       : ndarray (N, K)，后验概率矩阵
     """
-    X = np.stack(client_features, axis=0)   # (N, D)
+    print(f"\n  [GMM] 提取 BN 层统计特征（Round {round_idx + 1}）...")
+    features = [extract_bn_feature(w) for w in local_weights]
+    feat_dim = features[0].shape[0]
+    print(f"  [GMM] 客户端特征向量维度: {feat_dim}")
 
-    # 若客户端数 < 部件数，退化为 k-means 式硬分配
-    effective_k = min(n_clusters, len(X))
+    X = np.stack(features, axis=0)   # (N, D)
+    effective_k = min(n_clusters, num_clients)
 
+    # 使用多次随机初始化取最优，提升稳定性
     gmm = GaussianMixture(
         n_components=effective_k,
-        covariance_type='diag',   # 对角协方差，适合高维特征
-        max_iter=200,
-        random_state=random_state,
-        reg_covar=1e-4,           # 正则化，防止数值奇异
+        covariance_type='diag',
+        max_iter=300,
+        n_init=5,            # 多次随机初始化，选 BIC 最优
+        random_state=None,   # 不固定种子，让每次重聚类有机会探索不同解
+        reg_covar=1e-4,
     )
     gmm.fit(X)
 
-    posteriors  = gmm.predict_proba(X)          # (N, K)
-    assignments = posteriors.argmax(axis=1).tolist()
+    posteriors       = gmm.predict_proba(X)           # (N, K)
+    new_assignments  = posteriors.argmax(axis=1).tolist()
 
-    return gmm, assignments, posteriors
+    # 检测分配变化
+    changed = (prev_assignments is None) or (new_assignments != prev_assignments)
+
+    print(f"  [GMM] 客户端分簇结果（{'首次' if prev_assignments is None else '重聚类'}）:")
+    for i, k in enumerate(new_assignments):
+        prob_str = ', '.join([f'C{j}:{posteriors[i, j]:.3f}'
+                              for j in range(posteriors.shape[1])])
+        change_tag = ''
+        if prev_assignments is not None and new_assignments[i] != prev_assignments[i]:
+            change_tag = f'  ← 从 Cluster {prev_assignments[i]} 迁移'
+        print(f"    Client {i} → Cluster {k}  ({prob_str}){change_tag}")
+
+    for k in range(effective_k):
+        members = [i for i, c in enumerate(new_assignments) if c == k]
+        print(f"  Cluster {k}: {members} ({len(members)} 个客户端)")
+
+    if not changed:
+        print(f"  [GMM] 分配结果与上次相同，无需重置簇模型。")
+
+    # 追加到聚类日志
+    cluster_log.append({
+        'round':        round_idx + 1,
+        'trigger':      'warmup_end' if prev_assignments is None else 'recluster',
+        'feature_dim':  int(feat_dim),
+        'assignments':  new_assignments,
+        'changed':      changed,
+        'posteriors':   posteriors.tolist(),
+        'cluster_members': {
+            str(k): [i for i, c in enumerate(new_assignments) if c == k]
+            for k in range(effective_k)
+        },
+    })
+
+    # 实时写入聚类日志 JSON
+    log_path = os.path.join(run_dir, 'gmm_cluster_log.json')
+    with open(log_path, 'w', encoding='utf-8') as f:
+        json.dump(cluster_log, f, ensure_ascii=False, indent=2)
+    print(f"  [GMM] 聚类日志已更新: {log_path}")
+
+    return new_assignments, changed, posteriors
 
 
 # ==================== 联邦聚合 ====================
 
 def fedavg(base_model, weights_list, lens_list):
-    """
-    加权平均聚合：按数据量比例对 state_dict 进行加权平均，
-    结果写入 base_model 并返回。
-    """
+    """按数据量加权平均聚合，结果写入 base_model 并返回。"""
     total = sum(lens_list)
     global_dict = copy.deepcopy(weights_list[0])
     for key in global_dict:
@@ -253,41 +324,41 @@ class Client:
 # ==================== 结果保存 ====================
 
 def save_cluster_csv(cluster_history, run_dir):
-    """保存每轮每簇验证数据到 CSV"""
     path = os.path.join(run_dir, 'cluster_val_results.csv')
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['Round', 'Cluster', 'Num_Clients', 'Num_Samples',
+        writer.writerow(['Round', 'Phase', 'Cluster', 'Num_Clients', 'Num_Samples',
                          'Pixel_Accuracy', 'mIoU', 'Avg_Loss'])
         for r in cluster_history:
             writer.writerow([
-                r['round'], r['cluster'], r['num_clients'], r['num_samples'],
+                r['round'], r['phase'], r['cluster'],
+                r['num_clients'], r['num_samples'],
                 f"{r['pixel_acc']:.6f}", f"{r['miou']:.6f}", f"{r['avg_loss']:.6f}",
             ])
     return path
 
 
 def save_global_csv(global_history, run_dir):
-    """保存每轮全局模型验证数据到 CSV"""
     path = os.path.join(run_dir, 'global_val_results.csv')
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['Round', 'Pixel_Accuracy', 'mIoU', 'Avg_Loss', 'Time_s'])
+        writer.writerow(['Round', 'Phase', 'Pixel_Accuracy', 'mIoU', 'Avg_Loss', 'Time_s'])
         for r in global_history:
             writer.writerow([
-                r['round'], f"{r['pixel_acc']:.6f}", f"{r['miou']:.6f}",
+                r['round'], r['phase'],
+                f"{r['pixel_acc']:.6f}", f"{r['miou']:.6f}",
                 f"{r['avg_loss']:.6f}", f"{r['time']:.1f}",
             ])
     return path
 
 
-def save_curves(cluster_history, global_history, num_clusters, run_dir):
+def save_curves(cluster_history, global_history, num_clusters, warmup_rounds, run_dir):
     """
     生成两张折线图：
-      1. pixel_accuracy.png — 各簇 + 全局 Pixel Accuracy 随轮次变化
-      2. miou.png           — 各簇 + 全局 mIoU 随轮次变化
+      1. pixel_accuracy.png — 各簇（虚线）+ 全局（黑色实线）Pixel Accuracy
+      2. miou.png           — 各簇（虚线）+ 全局（黑色实线）mIoU
+    热身期与分簇期之间用竖虚线分隔。
     """
-    # 整理数据
     cluster_data = {k: {'rounds': [], 'pa': [], 'miou': []} for k in range(num_clusters)}
     for r in cluster_history:
         k = r['cluster']
@@ -301,17 +372,22 @@ def save_curves(cluster_history, global_history, num_clusters, run_dir):
 
     colors = plt.cm.tab10.colors
 
-    for metric, ylabel, title, suffix, c_key, g_data in [
-        ('pixel_acc', 'Pixel Accuracy',
+    for ylabel, title, suffix, c_key, g_data in [
+        ('Pixel Accuracy',
          'Pixel Accuracy per Cluster & Global vs. Round',
          'pixel_accuracy.png', 'pa', global_pa),
-        ('miou', 'mIoU',
+        ('mIoU',
          'mIoU per Cluster & Global vs. Round',
          'miou.png', 'miou', global_miou),
     ]:
-        plt.figure(figsize=(12, 6))
+        plt.figure(figsize=(13, 6))
 
-        # 各簇曲线（虚线）
+        # 热身期与分簇期分隔线
+        if warmup_rounds > 0 and global_rounds and warmup_rounds < max(global_rounds):
+            plt.axvline(x=warmup_rounds + 0.5, color='gray', linestyle=':', linewidth=1.5,
+                        label=f'Warmup End (R{warmup_rounds})')
+
+        # 各簇曲线（虚线，仅分簇期有数据）
         for k in range(num_clusters):
             d = cluster_data[k]
             if d['rounds']:
@@ -320,7 +396,7 @@ def save_curves(cluster_history, global_history, num_clusters, run_dir):
                          color=colors[k % len(colors)],
                          label=f'Cluster {k}')
 
-        # 全局曲线（实线，加粗）
+        # 全局曲线（实线，加粗，贯穿全程）
         if global_rounds:
             plt.plot(global_rounds, g_data,
                      linestyle='-', marker='s', linewidth=2.5, markersize=4,
@@ -356,15 +432,15 @@ def main():
     from torchvision import transforms
 
     # ==================== 配置区 ====================
-    USE_AMP       = True
-    TARGET_SIZE   = (256, 256)
-    NUM_ROUNDS    = 50
-    NUM_CLIENTS   = 5
-    LOCAL_EPOCHS  = 5
-    LR            = 0.01
-    NUM_WORKERS   = 0 if sys.platform == 'win32' else 4
-    PIN_MEMORY    = True
-    BATCH_SIZE    = 0       # 0 = 自动推荐
+    USE_AMP      = True
+    TARGET_SIZE  = (256, 256)
+    NUM_ROUNDS   = 50
+    NUM_CLIENTS  = 10
+    LOCAL_EPOCHS = 5
+    LR           = 0.01
+    NUM_WORKERS  = 0 if sys.platform == 'win32' else 4
+    PIN_MEMORY   = True
+    BATCH_SIZE   = 0        # 0 = 自动推荐
     # ================================================
 
     # ===== 时间戳运行目录 =====
@@ -390,13 +466,15 @@ def main():
     if BATCH_SIZE == 0:
         BATCH_SIZE = auto_batch_size(device, min_data)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*65}")
     print(f"训练配置:")
     print(f"  训练集: {num_images} 张 | 验证集: {len(val_dataset)} 张")
     print(f"  客户端: {NUM_CLIENTS} 个 | 簇数: {NUM_CLUSTERS}")
+    print(f"  热身轮数: {WARMUP_ROUNDS} | 重聚类间隔: "
+          f"{'禁用' if RECLUSTER_INTERVAL == 0 else f'每 {RECLUSTER_INTERVAL} 轮'}")
     print(f"  Batch Size: {BATCH_SIZE} | Local Epochs: {LOCAL_EPOCHS} | 联邦轮数: {NUM_ROUNDS}")
     print(f"  学习率: {LR} | AMP: {'已启用' if USE_AMP and torch.cuda.is_available() else '未启用'}")
-    print(f"{'='*60}")
+    print(f"{'='*65}")
 
     # ===== 初始化全局模型 =====
     global_model = MobileNetV2UNet(num_classes=NUM_CLASSES).to(device)
@@ -414,44 +492,43 @@ def main():
     print_gpu_status(device, "训练前基线")
 
     # ===== 状态变量 =====
-    # cluster_models[k]: 第 k 簇的当前簇模型（初始为全局模型副本）
-    cluster_models     = [copy.deepcopy(global_model) for _ in range(NUM_CLUSTERS)]
-    # client_cluster[i]: 客户端 i 所属簇编号（GMM 分配后确定）
-    client_cluster     = None
-    gmm_fitted         = False
+    cluster_models  = [copy.deepcopy(global_model) for _ in range(NUM_CLUSTERS)]
+    client_cluster  = None          # 当前分簇结果，None 表示热身期
+    last_cluster_round = -1         # 上次执行聚类的轮次索引
+    cluster_log     = []            # 每次聚类的详细记录
 
-    cluster_history = []   # 每轮每簇验证记录
-    global_history  = []   # 每轮全局模型验证记录
+    cluster_history = []
+    global_history  = []
     best_miou       = 0.0
     total_time      = 0.0
 
     print(f"\n{'='*80}")
-    print(f"开始 FedGMHC 训练...")
+    print(f"开始 FedGMHC 训练（热身 {WARMUP_ROUNDS} 轮 + 动态重聚类间隔 "
+          f"{'禁用' if RECLUSTER_INTERVAL == 0 else RECLUSTER_INTERVAL} 轮）...")
     print(f"{'='*80}")
 
     for round_idx in range(NUM_ROUNDS):
         round_start = time.time()
-        print(f"\n--- Round {round_idx + 1}/{NUM_ROUNDS} ---")
+        is_warmup   = (round_idx < WARMUP_ROUNDS)
+        phase_label = f'Warmup({round_idx + 1}/{WARMUP_ROUNDS})' if is_warmup else 'Clustered'
+        print(f"\n--- Round {round_idx + 1}/{NUM_ROUNDS}  [{phase_label}] ---")
 
         # ================================================================
         # 阶段 A：每个客户端本地训练
-        #   - 第 1 轮：从全局模型出发
-        #   - 第 2 轮起：从所属簇模型出发
+        #   热身期：从全局模型出发
+        #   分簇期：从所属簇模型出发
         # ================================================================
-        local_weights = []   # list of state_dict
+        local_weights = []
         local_losses  = []
         local_lens    = []
 
         for i in range(NUM_CLIENTS):
             client = Client(i, train_dataset, user_groups[i], device, use_amp=USE_AMP)
 
-            if round_idx == 0 or client_cluster is None:
-                # 第 1 轮：所有客户端使用全局模型
+            if is_warmup or client_cluster is None:
                 start_model = copy.deepcopy(global_model)
             else:
-                # 第 2 轮起：使用所属簇模型
-                k = client_cluster[i]
-                start_model = copy.deepcopy(cluster_models[k])
+                start_model = copy.deepcopy(cluster_models[client_cluster[i]])
 
             weights, loss = client.local_train(
                 start_model,
@@ -461,7 +538,6 @@ def main():
                 num_workers=NUM_WORKERS,
                 pin_memory=PIN_MEMORY,
             )
-
             local_weights.append(weights)
             local_losses.append(loss)
             local_lens.append(len(user_groups[i]))
@@ -474,58 +550,64 @@ def main():
         print(f"  所有客户端本地训练完成 | 平均 Loss: {avg_loss:.4f}")
 
         # ================================================================
-        # 阶段 B：第 1 轮结束后 → 提取 BN 特征 → GMM 聚类 → 分配客户端到簇
+        # 阶段 B：热身期 → 标准 FedAvg 聚合，同步所有簇模型
         # ================================================================
-        if round_idx == 0 and not gmm_fitted:
-            print(f"\n  [GMM] 提取 BN 层统计特征...")
-            features = [extract_bn_feature(w) for w in local_weights]
-            feat_dim = features[0].shape[0]
-            print(f"  [GMM] 客户端特征向量维度: {feat_dim}")
-
-            print(f"  [GMM] 拟合高斯混合模型（K={NUM_CLUSTERS}）...")
-            gmm, assignments, posteriors = fit_gmm_and_assign(features, n_clusters=NUM_CLUSTERS)
-            client_cluster = assignments
-            gmm_fitted = True
-
-            print(f"  [GMM] 客户端分簇结果:")
-            for i, k in enumerate(client_cluster):
-                prob_str = ', '.join([f'C{j}:{posteriors[i,j]:.3f}' for j in range(posteriors.shape[1])])
-                print(f"    Client {i} → Cluster {k}  (后验概率: {prob_str})")
-
-            # 簇分配摘要
-            for k in range(NUM_CLUSTERS):
-                members = [i for i, c in enumerate(client_cluster) if c == k]
-                print(f"  Cluster {k}: {members} ({len(members)} 个客户端)")
-
-            # 保存分簇信息到 JSON
-            cluster_info = {
-                'num_clusters': NUM_CLUSTERS,
-                'feature_dim': int(feat_dim),
-                'assignments': client_cluster,
-                'posteriors': posteriors.tolist(),
-                'cluster_members': {
-                    str(k): [i for i, c in enumerate(client_cluster) if c == k]
-                    for k in range(NUM_CLUSTERS)
-                },
-            }
-            with open(os.path.join(run_dir, 'gmm_cluster_info.json'), 'w', encoding='utf-8') as f:
-                json.dump(cluster_info, f, ensure_ascii=False, indent=2)
-            print(f"  [GMM] 分簇信息已保存: {run_dir}/gmm_cluster_info.json")
-
-        # ================================================================
-        # 阶段 C：簇内聚合 → 更新各簇模型
-        # ================================================================
-        if client_cluster is None:
-            # 第 1 轮 GMM 尚未完成时，退化为全局 FedAvg（仅此一轮）
+        if is_warmup:
             global_model = fedavg(global_model, local_weights, local_lens)
-            # 同步到所有簇模型（作为下一轮的起点）
+            # 热身期簇模型始终与全局模型保持同步
             for k in range(NUM_CLUSTERS):
                 cluster_models[k].load_state_dict(copy.deepcopy(global_model.state_dict()))
-        else:
-            # 按簇分组聚合
+
+        # ================================================================
+        # 阶段 C：热身期结束后 → 首次 GMM 聚类
+        # ================================================================
+        if round_idx == WARMUP_ROUNDS - 1:
+            print(f"\n  [GMM] 热身期结束，执行首次聚类...")
+            client_cluster, _, _ = run_gmm_clustering(
+                local_weights, NUM_CLIENTS, NUM_CLUSTERS,
+                round_idx, run_dir, cluster_log,
+                prev_assignments=None,
+            )
+            last_cluster_round = round_idx
+
+        # ================================================================
+        # 阶段 D：分簇期 → 簇内聚合 + 全局聚合
+        # ================================================================
+        if not is_warmup and client_cluster is not None:
+
+            # ---- D1: 检查是否触发动态重聚类 ----
+            rounds_since_last = round_idx - last_cluster_round
+            should_recluster  = (
+                RECLUSTER_INTERVAL > 0
+                and rounds_since_last >= RECLUSTER_INTERVAL
+                and round_idx > WARMUP_ROUNDS - 1   # 不在热身期末尾重复聚类
+            )
+
+            if should_recluster:
+                print(f"\n  [GMM] 触发动态重聚类（距上次聚类已过 {rounds_since_last} 轮）...")
+                new_assignments, changed, _ = run_gmm_clustering(
+                    local_weights, NUM_CLIENTS, NUM_CLUSTERS,
+                    round_idx, run_dir, cluster_log,
+                    prev_assignments=client_cluster,
+                )
+                if changed:
+                    # 分配发生变化：将发生迁移的客户端所在新簇模型重置为全局模型，
+                    # 避免旧簇知识污染新分组
+                    changed_clusters = set()
+                    for i in range(NUM_CLIENTS):
+                        if new_assignments[i] != client_cluster[i]:
+                            changed_clusters.add(new_assignments[i])
+                    for k in changed_clusters:
+                        cluster_models[k].load_state_dict(
+                            copy.deepcopy(global_model.state_dict())
+                        )
+                        print(f"  [GMM] Cluster {k} 模型已重置为全局模型（因有新成员加入）")
+                client_cluster     = new_assignments
+                last_cluster_round = round_idx
+
+            # ---- D2: 簇内 FedAvg ----
             cluster_weights_map = {k: [] for k in range(NUM_CLUSTERS)}
             cluster_lens_map    = {k: [] for k in range(NUM_CLUSTERS)}
-
             for i in range(NUM_CLIENTS):
                 k = client_cluster[i]
                 cluster_weights_map[k].append(local_weights[i])
@@ -541,40 +623,39 @@ def main():
                     )
                     cluster_total_lens.append(sum(cluster_lens_map[k]))
                 else:
-                    # 该簇本轮无客户端，保持原模型不变
                     cluster_total_lens.append(0)
 
-            # ================================================================
-            # 阶段 D：各簇模型聚合 → 更新全局模型
-            # ================================================================
-            active_cluster_weights = []
-            active_cluster_lens    = []
-            for k in range(NUM_CLUSTERS):
-                if cluster_total_lens[k] > 0:
-                    active_cluster_weights.append(cluster_models[k].state_dict())
-                    active_cluster_lens.append(cluster_total_lens[k])
-
-            if active_cluster_weights:
-                global_model = fedavg(global_model, active_cluster_weights, active_cluster_lens)
+            # ---- D3: 各簇模型 → 全局模型 ----
+            active_weights = [cluster_models[k].state_dict()
+                              for k in range(NUM_CLUSTERS) if cluster_total_lens[k] > 0]
+            active_lens    = [cluster_total_lens[k]
+                              for k in range(NUM_CLUSTERS) if cluster_total_lens[k] > 0]
+            if active_weights:
+                global_model = fedavg(global_model, active_weights, active_lens)
 
         del local_weights
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         # ================================================================
-        # 阶段 E：验证 — 每个簇模型 + 全局模型
+        # 阶段 E：验证
         # ================================================================
-        # 各簇模型验证
+        # 各簇模型验证（分簇期才有意义；热身期也记录，便于对比）
         for k in range(NUM_CLUSTERS):
-            members = ([i for i, c in enumerate(client_cluster) if c == k]
-                       if client_cluster else list(range(NUM_CLIENTS)))
-            n_samples = sum(local_lens[i] for i in members) if members else 0
-            k_loss    = (float(np.mean([local_losses[i] for i in members]))
-                         if members else avg_loss)
+            if client_cluster is not None:
+                members   = [i for i, c in enumerate(client_cluster) if c == k]
+                n_samples = sum(local_lens[i] for i in members)
+                k_loss    = float(np.mean([local_losses[i] for i in members])) if members else avg_loss
+            else:
+                # 热身期：簇模型与全局模型相同，均匀分配
+                members   = list(range(NUM_CLIENTS))
+                n_samples = sum(local_lens)
+                k_loss    = avg_loss
 
             pa, miou = evaluate_model(cluster_models[k], val_loader, device, use_amp=USE_AMP)
             cluster_history.append({
                 'round':       round_idx + 1,
+                'phase':       'warmup' if is_warmup else 'clustered',
                 'cluster':     k,
                 'num_clients': len(members),
                 'num_samples': n_samples,
@@ -582,8 +663,8 @@ def main():
                 'miou':        miou,
                 'avg_loss':    k_loss,
             })
-            print(f"  [Cluster {k}] Pixel Acc: {pa:.4f} | mIoU: {miou:.4f} "
-                  f"| 成员: {members}")
+            member_str = str(members) if client_cluster is not None else 'all(warmup)'
+            print(f"  [Cluster {k}] Pixel Acc: {pa:.4f} | mIoU: {miou:.4f} | 成员: {member_str}")
 
         # 全局模型验证
         round_time = time.time() - round_start
@@ -592,12 +673,13 @@ def main():
         g_pa, g_miou = evaluate_model(global_model, val_loader, device, use_amp=USE_AMP)
         global_history.append({
             'round':     round_idx + 1,
+            'phase':     'warmup' if is_warmup else 'clustered',
             'pixel_acc': g_pa,
             'miou':      g_miou,
             'avg_loss':  avg_loss,
             'time':      round_time,
         })
-        print(f"  [Global] Pixel Acc: {g_pa:.4f} | mIoU: {g_miou:.4f} | 耗时: {round_time:.1f}s",
+        print(f"  [Global]    Pixel Acc: {g_pa:.4f} | mIoU: {g_miou:.4f} | 耗时: {round_time:.1f}s",
               end="")
 
         # 保存最优全局模型
@@ -626,7 +708,7 @@ def main():
             }, ckpt)
             print(f"  >> 检查点已保存: {ckpt}")
 
-        # 每轮实时更新 CSV（防止中途崩溃丢失数据）
+        # 每轮实时更新 CSV
         save_cluster_csv(cluster_history, run_dir)
         save_global_csv(global_history, run_dir)
 
@@ -643,7 +725,7 @@ def main():
     # ===== 生成折线图 =====
     print(f"\n{'='*60}")
     print(f"正在生成折线图...")
-    save_curves(cluster_history, global_history, NUM_CLUSTERS, run_dir)
+    save_curves(cluster_history, global_history, NUM_CLUSTERS, WARMUP_ROUNDS, run_dir)
 
     # ===== 打印训练总结 =====
     print(f"\n{'='*80}")
@@ -662,20 +744,21 @@ def main():
     print(f"  总训练时间:   {total_time:.1f}s ({total_time/60:.1f} min)")
     print(f"  平均每轮耗时: {total_time/NUM_ROUNDS:.1f}s")
     print(f"  最优全局 mIoU: {best_miou:.4f}")
+    print(f"  GMM 聚类次数: {len(cluster_log)} 次")
 
-    print(f"\n{'Round':<8} {'Loss':<12} {'Pixel Acc':<14} {'mIoU':<14} {'耗时(s)':<10}")
-    print(f"{'-'*58}")
+    print(f"\n{'Round':<8} {'Phase':<12} {'Loss':<12} {'Pixel Acc':<14} {'mIoU':<14} {'耗时(s)':<10}")
+    print(f"{'-'*70}")
     for h in global_history:
-        print(f"{h['round']:<8} {h['avg_loss']:<12.4f} {h['pixel_acc']:<14.4f} "
-              f"{h['miou']:<14.4f} {h['time']:<10.1f}")
-    print(f"{'-'*58}")
+        print(f"{h['round']:<8} {h['phase']:<12} {h['avg_loss']:<12.4f} "
+              f"{h['pixel_acc']:<14.4f} {h['miou']:<14.4f} {h['time']:<10.1f}")
+    print(f"{'-'*70}")
 
     print(f"\n本次运行所有结果已保存至: {run_dir}/")
-    print(f"  ├── gmm_cluster_info.json      ← GMM 分簇详情")
-    print(f"  ├── cluster_val_results.csv    ← 每轮每簇验证数据")
-    print(f"  ├── global_val_results.csv     ← 每轮全局模型验证数据")
-    print(f"  ├── pixel_accuracy.png         ← Pixel Accuracy 折线图")
-    print(f"  └── miou.png                   ← mIoU 折线图")
+    print(f"  ├── gmm_cluster_log.json      ← 每次聚类的详细记录")
+    print(f"  ├── cluster_val_results.csv   ← 每轮每簇验证数据")
+    print(f"  ├── global_val_results.csv    ← 每轮全局模型验证数据")
+    print(f"  ├── pixel_accuracy.png        ← Pixel Accuracy 折线图")
+    print(f"  └── miou.png                  ← mIoU 折线图")
     print(f"\n最优模型: {os.path.join(save_dir, 'best_model.pth')}")
     print(f"最终模型: {final_path}")
 
