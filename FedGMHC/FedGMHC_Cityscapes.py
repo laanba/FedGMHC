@@ -604,21 +604,40 @@ def main():
     DATASET_ROOT = r'E:\Autonomous Driving Dataset\Cityscapes dataset(10g)'
 
     USE_AMP      = True
-    # Cityscapes 原始分辨率为 1024×2048；推荐使用 (512, 1024) 保持宽高比 1:2
-    # 128×256 快速训练模式，显存占用约为 256×512 的 1/4
-    # 若租用 16GB+ 显卡（如 RTX 4080/4090），可改为 (256, 512) 或 (512, 1024)
+    # Cityscapes 原始分辨率为 1024×2048；保持宽高比 1:2
+    # 128×256 快速调试模式，显存占用约为 256×512 的 1/4
     TARGET_SIZE  = (128, 256)
-    NUM_ROUNDS   = 50
-    NUM_CLIENTS  = 10
-    LOCAL_EPOCHS = 1        # 联邦学习标准设置；通过增加通信轮数补偿
-    LR           = 0.01
+
+    # ==================== 快速调试模式开关 ====================
+    # DEBUG_MODE=True 时使用小参数，单次实验可在 15~20 分钟内完成
+    # 确认趋势正确后，将 DEBUG_MODE 改为 False 再跑完整实验
+    DEBUG_MODE   = True
+    # =====================================================================
+
+    if DEBUG_MODE:
+        NUM_ROUNDS      = 20    # 快速模式：20轮（全量 50 轮）
+        NUM_CLIENTS     = 10
+        LOCAL_EPOCHS    = 1
+        LR              = 0.01
+        BATCH_SIZE      = 8
+        DIRICHLET_ALPHA = 0.5   # 强异质性，更容易看出聚类优势
+        MIN_SAMPLES     = 30    # 每客户端最少 30 张
+        MAX_SAMPLES     = 50    # 每客户端最多 50 张（大幅缩短每轮训练时间）
+        EVAL_EVERY      = 2     # 每 2 轮验证一次（节省验证时间）
+        print("[DEBUG MODE] 快速调试模式已开启：20轮 / MAX_SAMPLES=50 / 每2轮验证")
+    else:
+        NUM_ROUNDS      = 50    # 完整实验轮数
+        NUM_CLIENTS     = 10
+        LOCAL_EPOCHS    = 1
+        LR              = 0.01
+        BATCH_SIZE      = 8
+        DIRICHLET_ALPHA = 0.5
+        MIN_SAMPLES     = 100
+        MAX_SAMPLES     = 200
+        EVAL_EVERY      = 1     # 每轮都验证
+
     NUM_WORKERS  = 0 if sys.platform == 'win32' else 4
     PIN_MEMORY   = True
-    BATCH_SIZE   = 8        # 128×256 分辨率下显存占用约为 256×512 的 1/4，可加大 batch
-    DIRICHLET_ALPHA = 1.0   # Dirichlet 浓度参数（越小异质性越强；推荐 0.5/1.0/2.0）
-    MIN_SAMPLES     = 100   # 每个客户端最少图像数量（Cityscapes 共 2974 张，每人约 149 张）
-    MAX_SAMPLES     = 200   # 每个客户端最多图像数量（限制数据量过多的客户端，加快每轮训练）
-                            # 设为 None 则不限制
     # ================================================
 
     # ===== 时间戳运行目录 =====
@@ -847,47 +866,53 @@ def main():
             torch.cuda.empty_cache()
 
         # ================================================================
-        # 阶段 E：验证
+        # 阶段 E：验证（支持 EVAL_EVERY 间隔验证，节省时间）
         # ================================================================
-        for k in range(NUM_CLUSTERS):
-            if client_cluster is not None:
-                members   = [i for i, c in enumerate(client_cluster) if c == k]
-                n_samples = sum(local_lens[i] for i in members)
-                k_loss    = float(np.mean([local_losses[i] for i in members])) if members else avg_loss
-            else:
-                members   = list(range(NUM_CLIENTS))
-                n_samples = sum(local_lens)
-                k_loss    = avg_loss
-
-            pa, miou = evaluate_model(cluster_models[k], val_loader, device, use_amp=USE_AMP)
-            cluster_history.append({
-                'round':       round_idx + 1,
-                'phase':       'warmup' if is_warmup else 'clustered',
-                'cluster':     k,
-                'num_clients': len(members),
-                'num_samples': n_samples,
-                'pixel_acc':   pa,
-                'miou':        miou,
-                'avg_loss':    k_loss,
-            })
-            member_str = str(members) if client_cluster is not None else 'all(warmup)'
-            print(f"  [Cluster {k}] Pixel Acc: {pa:.4f} | mIoU: {miou:.4f} | 成员: {member_str}")
-
-        # 全局模型验证
         round_time  = time.time() - round_start
         total_time += round_time
 
-        g_pa, g_miou = evaluate_model(global_model, val_loader, device, use_amp=USE_AMP)
-        global_history.append({
-            'round':     round_idx + 1,
-            'phase':     'warmup' if is_warmup else 'clustered',
-            'pixel_acc': g_pa,
-            'miou':      g_miou,
-            'avg_loss':  avg_loss,
-            'time':      round_time,
-        })
-        print(f"  [Global]    Pixel Acc: {g_pa:.4f} | mIoU: {g_miou:.4f} | 耗时: {round_time:.1f}s",
-              end="")
+        do_eval = ((round_idx + 1) % EVAL_EVERY == 0) or (round_idx + 1 == NUM_ROUNDS)
+
+        if do_eval:
+            for k in range(NUM_CLUSTERS):
+                if client_cluster is not None:
+                    members   = [i for i, c in enumerate(client_cluster) if c == k]
+                    n_samples = sum(local_lens[i] for i in members)
+                    k_loss    = float(np.mean([local_losses[i] for i in members])) if members else avg_loss
+                else:
+                    members   = list(range(NUM_CLIENTS))
+                    n_samples = sum(local_lens)
+                    k_loss    = avg_loss
+
+                pa, miou = evaluate_model(cluster_models[k], val_loader, device, use_amp=USE_AMP)
+                cluster_history.append({
+                    'round':       round_idx + 1,
+                    'phase':       'warmup' if is_warmup else 'clustered',
+                    'cluster':     k,
+                    'num_clients': len(members),
+                    'num_samples': n_samples,
+                    'pixel_acc':   pa,
+                    'miou':        miou,
+                    'avg_loss':    k_loss,
+                })
+                member_str = str(members) if client_cluster is not None else 'all(warmup)'
+                print(f"  [Cluster {k}] Pixel Acc: {pa:.4f} | mIoU: {miou:.4f} | 成员: {member_str}")
+
+            g_pa, g_miou = evaluate_model(global_model, val_loader, device, use_amp=USE_AMP)
+            global_history.append({
+                'round':     round_idx + 1,
+                'phase':     'warmup' if is_warmup else 'clustered',
+                'pixel_acc': g_pa,
+                'miou':      g_miou,
+                'avg_loss':  avg_loss,
+                'time':      round_time,
+            })
+            print(f"  [Global]    Pixel Acc: {g_pa:.4f} | mIoU: {g_miou:.4f} | 耗时: {round_time:.1f}s",
+                  end="")
+        else:
+            # 未验证轮次：仅记录损失和耗时
+            g_pa, g_miou = 0.0, 0.0
+            print(f"  [跳过验证] 平均 Loss: {avg_loss:.4f} | 耗时: {round_time:.1f}s", end="")
 
         if g_miou > best_miou:
             best_miou = g_miou
