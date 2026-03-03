@@ -60,6 +60,14 @@ import json
 from torch.utils.data import DataLoader, Subset
 from torch.cuda.amp import autocast, GradScaler
 
+import os
+import sys
+
+# ===== 路径修复：将项目根目录加入 sys.path，适配 FedGMHC/ 子目录运行 =====
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 from model import MobileNetV2UNet
 from dataset.cityscapes_dataset import (
     CityscapesDataset,
@@ -69,9 +77,6 @@ from dataset.cityscapes_dataset import (
     build_label_index_cityscapes,
 )
 from partition import dirichlet_partition, print_partition_stats
-
-import os
-import sys
 import time
 import csv
 import numpy as np
@@ -600,16 +605,16 @@ def main():
 
     USE_AMP      = True
     # Cityscapes 原始分辨率为 1024×2048；推荐使用 (512, 1024) 保持宽高比 1:2
-    # 4060 Ti 8GB 建议使用 (256, 512)，可用 BATCH_SIZE=4，速度与显存均衡
-    # 若租用 16GB+ 显卡（如 RTX 4080/4090），可改回 (512, 1024)，BATCH_SIZE=8~16
-    TARGET_SIZE  = (256, 512)
+    # 128×256 快速训练模式，显存占用约为 256×512 的 1/4
+    # 若租用 16GB+ 显卡（如 RTX 4080/4090），可改为 (256, 512) 或 (512, 1024)
+    TARGET_SIZE  = (128, 256)
     NUM_ROUNDS   = 50
     NUM_CLIENTS  = 10
     LOCAL_EPOCHS = 1        # 联邦学习标准设置；通过增加通信轮数补偿
     LR           = 0.01
     NUM_WORKERS  = 0 if sys.platform == 'win32' else 4
     PIN_MEMORY   = True
-    BATCH_SIZE   = 4        # 4060 Ti 8GB + 256×512 图像，AMP 下每张约 10MB，4张共 40MB
+    BATCH_SIZE   = 8        # 128×256 分辨率下显存占用约为 256×512 的 1/4，可加大 batch
     DIRICHLET_ALPHA = 1.0   # Dirichlet 浓度参数（越小异质性越强；推荐 0.5/1.0/2.0）
     MIN_SAMPLES     = 100   # 每个客户端最少图像数量（Cityscapes 共 2974 张，每人约 149 张）
     MAX_SAMPLES     = 200   # 每个客户端最多图像数量（限制数据量过多的客户端，加快每轮训练）

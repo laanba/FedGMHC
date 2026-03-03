@@ -29,6 +29,7 @@ SegFormer-B0 风格模型（PVTv2-B0 编码器 + All-MLP 解码器）：
   result_save/
   └── FedAvg_SF_MMDDHHmm/
       ├── global_val_results.csv    ← 每轮全局模型验证数据汇总表（实时更新）
+      ├── client_val_results.csv    ← 每轮每客户端训练损失汇总表（实时更新）
       ├── pixel_accuracy.png        ← 全局模型 Pixel Accuracy 折线图
       └── miou.png                  ← 全局模型 mIoU 折线图
 """
@@ -47,6 +48,11 @@ from torch.cuda.amp import autocast, GradScaler
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+# ===== 路径修复：将项目根目录加入 sys.path，适配 FedAvg/ 子目录运行 =====
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from model import build_segformer_b0
 from dataset.cityscapes_dataset import (
@@ -220,6 +226,22 @@ def save_global_csv(global_history, run_dir):
     return path
 
 
+def save_client_csv(client_history, run_dir):
+    """保存每轮每客户端训练损失汇总表（client_val_results.csv）。"""
+    path = os.path.join(run_dir, 'client_val_results.csv')
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Round', 'Client_ID', 'Num_Samples', 'Train_Loss'])
+        for r in client_history:
+            writer.writerow([
+                r['round'],
+                r['client_id'],
+                r['num_samples'],
+                f"{r['loss']:.6f}",
+            ])
+    return path
+
+
 def save_curves(global_history, run_dir):
     """生成 Pixel Accuracy 和 mIoU 随轮次变化的折线图。"""
     rounds    = [r['round']     for r in global_history]
@@ -271,9 +293,9 @@ def main():
     DATASET_ROOT = r'E:\Autonomous Driving Dataset\Cityscapes dataset(10g)'
 
     USE_AMP      = True
-    # Cityscapes 原始分辨率为 1024×2048；推荐使用 (512, 1024) 保持宽高比 1:2
-    # 4060 Ti 8GB 建议使用 (256, 512)，可用 BATCH_SIZE=4，速度与显存均衡
-    TARGET_SIZE  = (256, 512)
+    # Cityscapes 原始分辨率为 1024×2048；保持宽高比 1:2
+    # 128×256 快速训练模式，显存占用约为 256×512 的 1/4
+    TARGET_SIZE  = (128, 256)
     NUM_ROUNDS   = 50           # 训练轮数
     NUM_CLIENTS  = 10           # 客户端数量
     LOCAL_EPOCHS = 1            # 每轮本地训练轮数
@@ -281,7 +303,7 @@ def main():
     LR           = 1e-4
     NUM_WORKERS  = 0 if sys.platform == 'win32' else 4
     PIN_MEMORY   = True
-    BATCH_SIZE   = 4            # 4060 Ti 8GB + 256×512 + AMP，SegFormer 约 12MB/张
+    BATCH_SIZE   = 8            # 128×256 分辨率下显存占用约为 256×512 的 1/4，可加大 batch
     DIRICHLET_ALPHA = 0.5       # 异质性参数（0.5 = 强异质性）
     MIN_SAMPLES     = 100       # 每个客户端最少图像数量
     MAX_SAMPLES     = 200       # 每个客户端最多图像数量（None = 不限制）
@@ -374,6 +396,7 @@ def main():
     print_gpu_status(device, "训练前基线")
 
     global_history = []
+    client_history = []
     best_miou      = 0.0
     total_time     = 0.0
 
@@ -407,6 +430,14 @@ def main():
             local_weights.append(weights)
             local_losses.append(loss)
             local_lens.append(len(user_groups[i]))
+
+            # 记录每客户端本轮训练数据
+            client_history.append({
+                'round':       round_idx + 1,
+                'client_id':   i,
+                'num_samples': len(user_groups[i]),
+                'loss':        loss,
+            })
 
             del start_model
             if torch.cuda.is_available():
@@ -475,6 +506,7 @@ def main():
 
         # 每轮实时更新 CSV（防止意外中断丢失数据）
         save_global_csv(global_history, run_dir)
+        save_client_csv(client_history, run_dir)
 
     # ===== 保存最终全局模型 =====
     final_path = os.path.join(save_dir, 'fedavg_segformer_cityscapes_final.pth')
@@ -522,6 +554,7 @@ def main():
 
     print(f"\n本次运行所有结果已保存至: {run_dir}/")
     print(f"  ├── global_val_results.csv    ← 每轮全局模型验证数据")
+    print(f"  ├── client_val_results.csv    ← 每轮每客户端训练损失")
     print(f"  ├── pixel_accuracy.png        ← Pixel Accuracy 折线图")
     print(f"  └── miou.png                  ← mIoU 折线图")
     print(f"\n最优模型: {os.path.join(save_dir, 'best_model_fedavg_segformer_cityscapes.pth')}")
