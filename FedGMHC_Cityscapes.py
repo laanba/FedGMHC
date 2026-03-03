@@ -93,9 +93,11 @@ RECLUSTER_INTERVAL  = 10   # 动态重聚类间隔：每隔 M 轮重新聚类一
 # 重聚类后簇模型融合比例：新簇模型 = α × 全局模型 + (1-α) × 当前簇模型
 # α=0 完全保留原簇模型；α=1 等同于硬重置；推荐 0.2~0.4
 RECLUSTER_ALPHA     = 0.3
-# PCA 目标维度：降维后的特征维度，需满足 PCA_N_COMPONENTS < min(NUM_CLIENTS, feat_dim)
-# 推荐范围：[NUM_CLUSTERS, NUM_CLIENTS - 1]，默认取 min(NUM_CLIENTS//2, 5)
-PCA_N_COMPONENTS    = None  # None = 自动设置为 min(NUM_CLIENTS//2, 5)
+# PCA 目标维度：固定为 2 维
+# 2 维的优势：
+#   1. 参数数量极少（GMM 每部件只需 2+2+1=5 个参数），10个样本下不会奇异
+#   2. 可直接生成 2D 散点图，直观展示客户端聚类分布，适合放入论文
+PCA_N_COMPONENTS    = 2     # 固定 2 维，保证 GMM 数值稳定
 
 
 # ==================== 显存监控工具 ====================
@@ -215,13 +217,13 @@ def extract_bn_feature(state_dict):
 def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_dir,
                        cluster_log, prev_assignments=None):
     """
-    提取 BN 特征 → 标准化 → PCA 降维 → 拟合 GMM → 分配客户端到簇。
+    提取 BN 特征 → 标准化 → PCA 降维（2维）→ 拟合 GMM → 分配客户端到簇。
 
-    高维 BN 特征（维度通常远大于客户端数）直接送入 GMM 会导致后验概率
-    退化为 0/1（硬分配），失去概率软分配的意义。
-    解决方案：先用 StandardScaler 标准化，再用 PCA 将特征压缩到
-    PCA_N_COMPONENTS 维（默认 min(N//2, 5)），使特征维度远小于客户端数，
-    从而让 GMM 的高斯分布保持合理的宽度，后验概率恢复为有意义的软分配。
+    PCA 固定降到 2 维的原因：
+      - 10 个客户端样本下，高维 GMM 协方差矩阵奇异，后验概率退化为 0/1
+      - 2 维时 GMM 每部件只需 5 个参数，10 个样本足够支撑稳定拟合
+      - 2 维可直接生成散点图，直观展示客户端聚类分布
+    K-Means++ 兜底：若 GMM 全部失败，自动切换为 K-Means++ 硬分配。
     """
     print(f"\n  [GMM] 提取 BN 层统计特征（Round {round_idx + 1}）...")
     features = [extract_bn_feature(w) for w in local_weights]
@@ -236,12 +238,9 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
     scaler   = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # ---- Step 2: PCA 降维 ----
-    if PCA_N_COMPONENTS is not None:
-        n_components = PCA_N_COMPONENTS
-    else:
-        n_components = min(N // 2, 5)
-    n_components = max(effective_k, min(n_components, N - 1, feat_dim))
+    # ---- Step 2: PCA 降维（固定 2 维）----
+    # 2 维保证 GMM 数值稳定，且可生成 2D 散点图
+    n_components = max(2, min(PCA_N_COMPONENTS, N - 1, feat_dim))
 
     pca   = PCA(n_components=n_components, random_state=42)
     X_pca = pca.fit_transform(X_scaled).astype(np.float64)
@@ -250,40 +249,76 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
     print(f"  [GMM] PCA 降维: {feat_dim} → {n_components} 维 "
           f"（累计解释方差: {explained_var:.1f}%）")
 
-    # ---- Step 3: 拟合 GMM ----
-    def _fit_gmm(X_data, k, reg):
+    # ---- Step 3: 拟合 GMM（full 协方差，2维下完全可行）----
+    def _fit_gmm(X_data, k, reg, cov_type='full'):
         gmm = GaussianMixture(
             n_components=k,
-            covariance_type='diag',
-            max_iter=300,
-            n_init=5,
+            covariance_type=cov_type,
+            max_iter=500,
+            n_init=10,          # 10次随机初始化选最优，避免局部最优
             random_state=None,
             reg_covar=reg,
         )
         gmm.fit(X_data)
         return gmm
 
-    reg_list = [1e-2, 1e-1, 0.5, 1.0, 2.0]
+    # 2维下优先用 full 协方差，更准确；失败时退化到 diag，最后兜底 KMeans++
+    reg_list = [1e-3, 1e-2, 1e-1, 0.5, 1.0]
     gmm = None
     for reg in reg_list:
-        try:
-            gmm = _fit_gmm(X_pca, effective_k, reg)
-            print(f"  [GMM] 拟合成功 (reg_covar={reg})")
+        for cov_type in ['full', 'diag']:
+            try:
+                gmm = _fit_gmm(X_pca, effective_k, reg, cov_type)
+                print(f"  [GMM] 拟合成功 (covariance_type={cov_type}, reg_covar={reg})")
+                break
+            except (ValueError, np.linalg.LinAlgError) as e:
+                pass
+        if gmm is not None:
             break
-        except (ValueError, np.linalg.LinAlgError) as e:
-            print(f"  [GMM] reg_covar={reg} 拟合失败，尝试加大正则化系数... ({e})")
+
+    def _save_scatter(X_2d, labels, posteriors_2d, method_name, run_dir, round_idx):
+        """生成 2D 聚类散点图，每次聚类时保存。"""
+        if X_2d.shape[1] != 2:
+            return
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6']
+        fig, ax = plt.subplots(figsize=(7, 6))
+        for k in range(effective_k):
+            idx = [i for i, c in enumerate(labels) if c == k]
+            if idx:
+                ax.scatter(X_2d[idx, 0], X_2d[idx, 1],
+                           c=colors[k % len(colors)], s=120,
+                           label=f'Cluster {k}', zorder=3, edgecolors='white', linewidths=0.8)
+        # 标注客户端编号
+        for i in range(len(labels)):
+            ax.annotate(f'C{i}', (X_2d[i, 0], X_2d[i, 1]),
+                        textcoords='offset points', xytext=(6, 4), fontsize=9)
+        ax.set_xlabel('PC 1', fontsize=11)
+        ax.set_ylabel('PC 2', fontsize=11)
+        ax.set_title(f'Client Clustering (Round {round_idx + 1}, {method_name})', fontsize=12)
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        scatter_path = os.path.join(run_dir, f'cluster_scatter_round{round_idx + 1}.png')
+        fig.savefig(scatter_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  [GMM] 聚类散点图已保存: {scatter_path}")
 
     if gmm is None:
-        print("  [GMM] 警告：GMM 全部失败，降级为 KMeans 硬分配")
+        # K-Means++ 兜底
+        print("  [GMM] 警告：GMM 全部失败，降级为 KMeans++ 硬分配")
         from sklearn.cluster import KMeans
-        km = KMeans(n_clusters=effective_k, n_init=10, random_state=42)
+        km = KMeans(n_clusters=effective_k, init='k-means++', n_init=20, random_state=None)
         km.fit(X_pca)
         hard_labels  = km.labels_
         posteriors   = np.zeros((N, effective_k), dtype=np.float64)
         posteriors[np.arange(N), hard_labels] = 1.0
         new_assignments = hard_labels.tolist()
         changed = (prev_assignments is None) or (new_assignments != prev_assignments)
-        print(f"  [GMM/KMeans 降级] 分簇结果: {new_assignments}")
+        print(f"  [KMeans++] 分簇结果: {new_assignments}")
+        _save_scatter(X_pca, new_assignments, posteriors, 'KMeans++', run_dir, round_idx)
         cluster_log.append({
             'round':                 round_idx + 1,
             'trigger':               'warmup_end' if prev_assignments is None else 'recluster',
@@ -308,7 +343,26 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
     new_assignments = posteriors.argmax(axis=1).tolist()
     changed = (prev_assignments is None) or (new_assignments != prev_assignments)
 
-    print(f"  [GMM] 客户端分簇结果（{'首次' if prev_assignments is None else '重聚类'}）:")
+    # 检查后验概率是否仍然退化（最大概率均 > 0.99 视为退化）
+    max_probs = posteriors.max(axis=1)
+    if (max_probs > 0.99).all():
+        print("  [GMM] 警告：后验概率仍退化为 0/1，自动切换为 KMeans++ 硬分配")
+        from sklearn.cluster import KMeans
+        km = KMeans(n_clusters=effective_k, init='k-means++', n_init=20, random_state=None)
+        km.fit(X_pca)
+        hard_labels  = km.labels_
+        posteriors   = np.zeros((N, effective_k), dtype=np.float64)
+        posteriors[np.arange(N), hard_labels] = 1.0
+        new_assignments = hard_labels.tolist()
+        changed = (prev_assignments is None) or (new_assignments != prev_assignments)
+        method_used = 'kmeans_fallback'
+        print(f"  [KMeans++] 分簇结果: {new_assignments}")
+    else:
+        method_used = 'gmm'
+        print(f"  [GMM] 后验概率正常（最大概率范围: {max_probs.min():.3f} ~ {max_probs.max():.3f}）")
+
+    label_str = '首次' if prev_assignments is None else '重聚类'
+    print(f"  [GMM] 客户端分簇结果（{label_str}，方法: {method_used}）:")
     for i, k in enumerate(new_assignments):
         prob_str   = ', '.join([f'C{j}:{posteriors[i, j]:.3f}'
                                 for j in range(posteriors.shape[1])])
@@ -324,9 +378,13 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
     if not changed:
         print(f"  [GMM] 分配结果与上次相同，无需重置簇模型。")
 
+    # 生成 2D 聚类散点图
+    _save_scatter(X_pca, new_assignments, posteriors, method_used.upper(), run_dir, round_idx)
+
     cluster_log.append({
         'round':                 round_idx + 1,
         'trigger':               'warmup_end' if prev_assignments is None else 'recluster',
+        'method':                method_used,
         'feature_dim_raw':       int(feat_dim),
         'feature_dim_pca':       int(n_components),
         'pca_explained_var_pct': round(float(explained_var), 2),
