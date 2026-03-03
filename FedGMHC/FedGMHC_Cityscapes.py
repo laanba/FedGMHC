@@ -101,7 +101,12 @@ RECLUSTER_ALPHA     = 0.3
 # 2 维的优势：
 #   1. 参数数量极少（GMM 每部件只需 2+2+1=5 个参数），10个样本下不会奇异
 #   2. 可直接生成 2D 散点图，直观展示客户端聚类分布，适合放入论文
-PCA_N_COMPONENTS    = 2     # 固定 2 维，保证 GMM 数值稳定
+PCA_N_COMPONENTS    = 2     # 固定 2 维，保证 GMM 数値稳定
+# GMM 后验概率温度软化参数
+# 问题：2D PCA 后簇间距离过大，GMM 后验概率容易全部崩塑为 0/1（硬分簇）
+# 解决：用温度系数 T 软化 log 概率，T 越大概率越均匀
+# T=1 为原始 GMM 概率；T=5~10 通常能有效软化；T=∞ 则均匀分配
+GMM_TEMPERATURE     = 5.0   # 推荐范围 2.0~10.0；调大软化程度加强，调小接近硬分簇
 
 
 # ==================== 显存监控工具 ====================
@@ -221,13 +226,12 @@ def extract_bn_feature(state_dict):
 def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_dir,
                        cluster_log, prev_assignments=None):
     """
-    提取 BN 特征 → 标准化 → PCA 降维（2维）→ 拟合 GMM → 分配客户端到簇。
+    提取 BN 特征 → 标准化 → PCA 降维（2维）→ 拟合 GMM → 温度软化后验概率 → 返回软分配权重。
 
-    PCA 固定降到 2 维的原因：
-      - 10 个客户端样本下，高维 GMM 协方差矩阵奇异，后验概率退化为 0/1
-      - 2 维时 GMM 每部件只需 5 个参数，10 个样本足够支撑稳定拟合
-      - 2 维可直接生成散点图，直观展示客户端聚类分布
-    K-Means++ 兜底：若 GMM 全部失败，自动切换为 K-Means++ 硬分配。
+    核心设计：
+      - 不再使用 K-Means++ 底底；若 GMM 全部失败则抛出异常
+      - 用温度系数 T 软化 GMM 后验概率，解决 2D 空间簇间距离过大导致概率崩塑为 0/1 的问题
+      - 返回软权重矩阵 posteriors[i, k] 表示客户端 i 对簇 k 的贡献权重
     """
     print(f"\n  [GMM] 提取 BN 层统计特征（Round {round_idx + 1}）...")
     features = [extract_bn_feature(w) for w in local_weights]
@@ -259,14 +263,13 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
             n_components=k,
             covariance_type=cov_type,
             max_iter=500,
-            n_init=10,          # 10次随机初始化选最优，避免局部最优
+            n_init=10,
             random_state=None,
             reg_covar=reg,
         )
         gmm.fit(X_data)
         return gmm
 
-    # 2维下优先用 full 协方差，更准确；失败时退化到 diag，最后兜底 KMeans++
     reg_list = [1e-3, 1e-2, 1e-1, 0.5, 1.0]
     gmm = None
     for reg in reg_list:
@@ -275,34 +278,72 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
                 gmm = _fit_gmm(X_pca, effective_k, reg, cov_type)
                 print(f"  [GMM] 拟合成功 (covariance_type={cov_type}, reg_covar={reg})")
                 break
-            except (ValueError, np.linalg.LinAlgError) as e:
+            except (ValueError, np.linalg.LinAlgError):
                 pass
         if gmm is not None:
             break
 
-    def _save_scatter(X_2d, labels, posteriors_2d, method_name, run_dir, round_idx):
-        """生成 2D 聚类散点图，每次聚类时保存。"""
+    if gmm is None:
+        raise RuntimeError(
+            f"[GMM] 拟合全部失败（reg 尝试范围: {reg_list}），"
+            f"请检查 BN 特征是否全为零或客户端数量过少。"
+        )
+
+    # ---- Step 4: 基于欧式距离的温度 softmax 软化 ----
+    # 问题根源：2D PCA 后簇间距离高达万级，log 概率差异远超过 T 的调节能力
+    # 解决：用到簇中心的欧式距离做温度 softmax
+    #   posteriors[i, k] = softmax(-dist(x_i, mu_k) / T)
+    # 距离越小概率越高；T 越大概率越均匀；T 越小越接近硬分簇
+    means = gmm.means_                                                 # (K, D)
+    dists = np.linalg.norm(
+        X_pca[:, None, :] - means[None, :, :], axis=2
+    )                                                                  # (N, K)
+    neg_dist_T = -dists / GMM_TEMPERATURE
+    neg_dist_T -= neg_dist_T.max(axis=1, keepdims=True)               # 数値稳定
+    posteriors  = np.exp(neg_dist_T)
+    posteriors /= posteriors.sum(axis=1, keepdims=True)               # 归一化为概率
+
+    max_probs       = posteriors.max(axis=1)
+    new_assignments = posteriors.argmax(axis=1).tolist()   # 硬分簇结果（仅用于日志和重聚类判断）
+    changed         = (prev_assignments is None) or (new_assignments != prev_assignments)
+
+    print(f"  [GMM] 欧式距离温度软化（T={GMM_TEMPERATURE}）:")
+    print(f"        最大概率范围: {max_probs.min():.3f} ~ {max_probs.max():.3f}（T=1时通常为 0.99+）")
+    print(f"        各簇平均权重: {posteriors.mean(axis=0).round(3).tolist()}")
+
+    def _save_scatter(X_2d, labels, post, run_dir, round_idx):
+        """生成 2D 聚类散点图，点的颜色混合反映软分簇权重。"""
         if X_2d.shape[1] != 2:
             return
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6']
+        base_colors = np.array([
+            [0.91, 0.30, 0.24],   # 红
+            [0.18, 0.80, 0.44],   # 绿
+            [0.20, 0.60, 0.86],   # 蓝
+            [0.95, 0.61, 0.07],   # 橙
+            [0.61, 0.35, 0.71],   # 紫
+        ])
         fig, ax = plt.subplots(figsize=(7, 6))
-        for k in range(effective_k):
-            idx = [i for i, c in enumerate(labels) if c == k]
-            if idx:
-                ax.scatter(X_2d[idx, 0], X_2d[idx, 1],
-                           c=colors[k % len(colors)], s=120,
-                           label=f'Cluster {k}', zorder=3, edgecolors='white', linewidths=0.8)
-        # 标注客户端编号
         for i in range(len(labels)):
+            # 点的颜色 = 各簇颜色按软权重加权平均
+            color = np.zeros(3)
+            for k in range(min(effective_k, len(base_colors))):
+                color += post[i, k] * base_colors[k % len(base_colors)]
+            color = np.clip(color, 0, 1)
+            ax.scatter(X_2d[i, 0], X_2d[i, 1], c=[color], s=140,
+                       zorder=3, edgecolors='white', linewidths=0.8)
             ax.annotate(f'C{i}', (X_2d[i, 0], X_2d[i, 1]),
                         textcoords='offset points', xytext=(6, 4), fontsize=9)
+        # 图例色块
+        from matplotlib.patches import Patch
+        legend_elements = [Patch(facecolor=base_colors[k % len(base_colors)],
+                                 label=f'Cluster {k}') for k in range(effective_k)]
+        ax.legend(handles=legend_elements, fontsize=10)
         ax.set_xlabel('PC 1', fontsize=11)
         ax.set_ylabel('PC 2', fontsize=11)
-        ax.set_title(f'Client Clustering (Round {round_idx + 1}, {method_name})', fontsize=12)
-        ax.legend(fontsize=10)
+        ax.set_title(f'Client Soft Clustering (Round {round_idx + 1}, T={GMM_TEMPERATURE})', fontsize=12)
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         scatter_path = os.path.join(run_dir, f'cluster_scatter_round{round_idx + 1}.png')
@@ -310,85 +351,30 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
         plt.close(fig)
         print(f"  [GMM] 聚类散点图已保存: {scatter_path}")
 
-    if gmm is None:
-        # K-Means++ 兜底
-        print("  [GMM] 警告：GMM 全部失败，降级为 KMeans++ 硬分配")
-        from sklearn.cluster import KMeans
-        km = KMeans(n_clusters=effective_k, init='k-means++', n_init=20, random_state=None)
-        km.fit(X_pca)
-        hard_labels  = km.labels_
-        posteriors   = np.zeros((N, effective_k), dtype=np.float64)
-        posteriors[np.arange(N), hard_labels] = 1.0
-        new_assignments = hard_labels.tolist()
-        changed = (prev_assignments is None) or (new_assignments != prev_assignments)
-        print(f"  [KMeans++] 分簇结果: {new_assignments}")
-        _save_scatter(X_pca, new_assignments, posteriors, 'KMeans++', run_dir, round_idx)
-        cluster_log.append({
-            'round':                 round_idx + 1,
-            'trigger':               'warmup_end' if prev_assignments is None else 'recluster',
-            'method':                'kmeans_fallback',
-            'feature_dim_raw':       int(feat_dim),
-            'feature_dim_pca':       int(n_components),
-            'pca_explained_var_pct': round(float(explained_var), 2),
-            'assignments':           new_assignments,
-            'changed':               changed,
-            'posteriors':            posteriors.tolist(),
-            'cluster_members':       {
-                str(k): [i for i, c in enumerate(new_assignments) if c == k]
-                for k in range(effective_k)
-            },
-        })
-        log_path = os.path.join(run_dir, 'gmm_cluster_log.json')
-        with open(log_path, 'w', encoding='utf-8') as f:
-            json.dump(cluster_log, f, ensure_ascii=False, indent=2)
-        return new_assignments, changed, posteriors
-
-    posteriors      = gmm.predict_proba(X_pca)
-    new_assignments = posteriors.argmax(axis=1).tolist()
-    changed = (prev_assignments is None) or (new_assignments != prev_assignments)
-
-    # 检查后验概率是否仍然退化（最大概率均 > 0.99 视为退化）
-    max_probs = posteriors.max(axis=1)
-    if (max_probs > 0.99).all():
-        print("  [GMM] 警告：后验概率仍退化为 0/1，自动切换为 KMeans++ 硬分配")
-        from sklearn.cluster import KMeans
-        km = KMeans(n_clusters=effective_k, init='k-means++', n_init=20, random_state=None)
-        km.fit(X_pca)
-        hard_labels  = km.labels_
-        posteriors   = np.zeros((N, effective_k), dtype=np.float64)
-        posteriors[np.arange(N), hard_labels] = 1.0
-        new_assignments = hard_labels.tolist()
-        changed = (prev_assignments is None) or (new_assignments != prev_assignments)
-        method_used = 'kmeans_fallback'
-        print(f"  [KMeans++] 分簇结果: {new_assignments}")
-    else:
-        method_used = 'gmm'
-        print(f"  [GMM] 后验概率正常（最大概率范围: {max_probs.min():.3f} ~ {max_probs.max():.3f}）")
-
     label_str = '首次' if prev_assignments is None else '重聚类'
-    print(f"  [GMM] 客户端分簇结果（{label_str}，方法: {method_used}）:")
-    for i, k in enumerate(new_assignments):
+    print(f"  [GMM] 客户端软分簇权重（{label_str}）:")
+    for i in range(N):
         prob_str   = ', '.join([f'C{j}:{posteriors[i, j]:.3f}'
                                 for j in range(posteriors.shape[1])])
         change_tag = ''
         if prev_assignments is not None and new_assignments[i] != prev_assignments[i]:
-            change_tag = f'  ← 从 Cluster {prev_assignments[i]} 迁移'
-        print(f"    Client {i} → Cluster {k}  ({prob_str}){change_tag}")
+            change_tag = f'  ← 主簇从 Cluster {prev_assignments[i]} 迁移'
+        print(f"    Client {i} 主簇 Cluster {new_assignments[i]}  ({prob_str}){change_tag}")
 
     for k in range(effective_k):
         members = [i for i, c in enumerate(new_assignments) if c == k]
-        print(f"  Cluster {k}: {members} ({len(members)} 个客户端)")
+        print(f"  Cluster {k}: {members} ({len(members)} 个客户端为主簇，其他客户端也有部分贡献)")
 
     if not changed:
-        print(f"  [GMM] 分配结果与上次相同，无需重置簇模型。")
+        print(f"  [GMM] 主簇分配结果与上次相同。")
 
-    # 生成 2D 聚类散点图
-    _save_scatter(X_pca, new_assignments, posteriors, method_used.upper(), run_dir, round_idx)
+    _save_scatter(X_pca, new_assignments, posteriors, run_dir, round_idx)
 
     cluster_log.append({
         'round':                 round_idx + 1,
         'trigger':               'warmup_end' if prev_assignments is None else 'recluster',
-        'method':                method_used,
+        'method':                'gmm_soft',
+        'temperature':           GMM_TEMPERATURE,
         'feature_dim_raw':       int(feat_dim),
         'feature_dim_pca':       int(n_components),
         'pca_explained_var_pct': round(float(explained_var), 2),
@@ -725,7 +711,8 @@ def main():
 
     # ===== 状态变量 =====
     cluster_models     = [copy.deepcopy(global_model) for _ in range(NUM_CLUSTERS)]
-    client_cluster     = None   # 当前分簇结果，None 表示热身期
+    client_cluster     = None   # 当前主簇分配（argmax），None 表示热身期
+    client_posteriors  = None   # 当前软分簇权重矩阵 (N, K)，None 表示热身期
     last_cluster_round = -1     # 上次执行聚类的轮次索引
     cluster_log        = []     # 每次聚类的详细记录
 
@@ -793,7 +780,7 @@ def main():
         # ================================================================
         if round_idx == WARMUP_ROUNDS - 1:
             print(f"\n  [GMM] 热身期结束，执行首次聚类...")
-            client_cluster, _, _ = run_gmm_clustering(
+            client_cluster, _, client_posteriors = run_gmm_clustering(
                 local_weights, NUM_CLIENTS, NUM_CLUSTERS,
                 round_idx, run_dir, cluster_log,
                 prev_assignments=None,
@@ -815,7 +802,7 @@ def main():
 
             if should_recluster:
                 print(f"\n  [GMM] 触发动态重聚类（距上次聚类已过 {rounds_since_last} 轮）...")
-                new_assignments, changed, _ = run_gmm_clustering(
+                new_assignments, changed, new_posteriors = run_gmm_clustering(
                     local_weights, NUM_CLIENTS, NUM_CLUSTERS,
                     round_idx, run_dir, cluster_log,
                     prev_assignments=client_cluster,
@@ -827,37 +814,40 @@ def main():
                             changed_clusters.add(new_assignments[i])
                     for k in changed_clusters:
                         interpolate_models(cluster_models[k], global_model, RECLUSTER_ALPHA)
-                        print(f"  [GMM] Cluster {k} 模型已插值融合 "
+                        print(f"  [GMM] Cluster {k} 模型已插値融合 "
                               f"(α={RECLUSTER_ALPHA}: {RECLUSTER_ALPHA:.0%} 全局 + "
                               f"{1-RECLUSTER_ALPHA:.0%} 原簇，因有新成员加入)")
                 client_cluster     = new_assignments
+                client_posteriors  = new_posteriors
                 last_cluster_round = round_idx
 
-            # ---- D2: 簇内 FedAvg ----
-            cluster_weights_map = {k: [] for k in range(NUM_CLUSTERS)}
-            cluster_lens_map    = {k: [] for k in range(NUM_CLUSTERS)}
-            for i in range(NUM_CLIENTS):
-                k = client_cluster[i]
-                cluster_weights_map[k].append(local_weights[i])
-                cluster_lens_map[k].append(local_lens[i])
-
+            # ---- D2: 簇内软加权聚合（用 GMM 软权重替代硬分配）----
+            # 簇 k 的聚合权重：客户端 i 的贡献 = posteriors[i, k] * local_lens[i]
             cluster_total_lens = []
             for k in range(NUM_CLUSTERS):
-                if cluster_weights_map[k]:
-                    cluster_models[k] = fedavg(
-                        cluster_models[k],
-                        cluster_weights_map[k],
-                        cluster_lens_map[k],
-                    )
-                    cluster_total_lens.append(sum(cluster_lens_map[k]))
-                else:
+                # 计算每个客户端对簇 k 的加权量
+                soft_lens = [client_posteriors[i, k] * local_lens[i]
+                             for i in range(NUM_CLIENTS)]
+                total_soft = sum(soft_lens)
+                if total_soft < 1e-8:
                     cluster_total_lens.append(0)
+                    continue
 
-            # ---- D3: 各簇模型 → 全局模型 ----
+                # 用软权重加权平均各客户端模型参数
+                new_sd = copy.deepcopy(local_weights[0])
+                for key in new_sd:
+                    new_sd[key] = sum(
+                        local_weights[i][key] * (soft_lens[i] / total_soft)
+                        for i in range(NUM_CLIENTS)
+                    )
+                cluster_models[k].load_state_dict(new_sd)
+                cluster_total_lens.append(total_soft)
+
+            # ---- D3: 各簇模型 → 全局模型（按簇权重汇总）----
             active_weights = [cluster_models[k].state_dict()
-                              for k in range(NUM_CLUSTERS) if cluster_total_lens[k] > 0]
+                              for k in range(NUM_CLUSTERS) if cluster_total_lens[k] > 1e-8]
             active_lens    = [cluster_total_lens[k]
-                              for k in range(NUM_CLUSTERS) if cluster_total_lens[k] > 0]
+                              for k in range(NUM_CLUSTERS) if cluster_total_lens[k] > 1e-8]
             if active_weights:
                 global_model = fedavg(global_model, active_weights, active_lens)
 
@@ -875,10 +865,13 @@ def main():
 
         if do_eval:
             for k in range(NUM_CLUSTERS):
-                if client_cluster is not None:
+                if client_cluster is not None and client_posteriors is not None:
+                    # 软分簇：主簇成员（argmax）为显示用，加权样本数用软权重
                     members   = [i for i, c in enumerate(client_cluster) if c == k]
-                    n_samples = sum(local_lens[i] for i in members)
-                    k_loss    = float(np.mean([local_losses[i] for i in members])) if members else avg_loss
+                    n_samples = float(sum(client_posteriors[i, k] * local_lens[i]
+                                         for i in range(NUM_CLIENTS)))
+                    k_loss    = float(np.average([local_losses[i] for i in range(NUM_CLIENTS)],
+                                                weights=[client_posteriors[i, k] for i in range(NUM_CLIENTS)]))
                 else:
                     members   = list(range(NUM_CLIENTS))
                     n_samples = sum(local_lens)
@@ -896,7 +889,7 @@ def main():
                     'avg_loss':    k_loss,
                 })
                 member_str = str(members) if client_cluster is not None else 'all(warmup)'
-                print(f"  [Cluster {k}] Pixel Acc: {pa:.4f} | mIoU: {miou:.4f} | 成员: {member_str}")
+                print(f"  [Cluster {k}] Pixel Acc: {pa:.4f} | mIoU: {miou:.4f} | 主簇成员: {member_str}")
 
             g_pa, g_miou = evaluate_model(global_model, val_loader, device, use_amp=USE_AMP)
             global_history.append({
