@@ -41,7 +41,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from model import MobileNetV2UNet
-from cityscapes_dataset import (
+from dataset.cityscapes_dataset import (
     CityscapesDataset,
     NUM_CLASSES,
     CLASS_NAMES,
@@ -276,7 +276,7 @@ def main():
 
     # ===== 时间戳运行目录 =====
     run_timestamp = datetime.now().strftime('%m%d%H%M')
-    run_dir = os.path.join('./result_save', f'FedAvg_{run_timestamp}')
+    run_dir = os.path.join('../result_save', f'FedAvg_{run_timestamp}')
     os.makedirs(run_dir, exist_ok=True)
     print(f"\n本次运行结果将保存至: {run_dir}/")
 
@@ -346,7 +346,7 @@ def main():
         num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
     )
 
-    save_dir = './checkpoints'
+    save_dir = '../checkpoints'
     os.makedirs(save_dir, exist_ok=True)
 
     if torch.cuda.is_available():

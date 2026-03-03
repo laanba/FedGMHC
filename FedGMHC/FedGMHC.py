@@ -1,13 +1,5 @@
 """
-FedGMHC_Cityscapes.py — 基于高斯混合模型（GMM）分簇的联邦学习方法
-                         专用于 Cityscapes 数据集
-
-数据集说明
-----------
-- 图像目录: <DATASET_ROOT>/leftImg8bit/train|val/<city>/
-- 标签目录: <DATASET_ROOT>/gtFine/train|val/<city>/*_gtFine_labelIds.png
-- 训练类别: 19 类（road, sidewalk, building, ..., bicycle）
-- 忽略类别: void（trainId=255），CrossEntropyLoss 中 ignore_index=255
+FedGMHC.py — 基于高斯混合模型（GMM）分簇的联邦学习方法
 
 冷启动解决策略（组合方案）
 --------------------------
@@ -44,9 +36,9 @@ FedGMHC_Cityscapes.py — 基于高斯混合模型（GMM）分簇的联邦学习
 
 结果保存
 --------
-每次运行结果统一保存在 result_save/FedGMHC_MMDDHHmm/ 子目录下：
+每次运行结果统一保存在 result_save/MMDDHHmm/ 子目录下：
   result_save/
-  └── FedGMHC_MMDDHHmm/
+  └── MMDDHHmm/
       ├── gmm_cluster_log.json       ← 每次聚类的详细记录（含轮次、分配、后验概率）
       ├── cluster_val_results.csv    ← 每轮每簇验证数据汇总表（实时更新）
       ├── global_val_results.csv     ← 每轮全局模型验证数据汇总表（实时更新）
@@ -62,14 +54,8 @@ from torch.utils.data import DataLoader, Subset
 from torch.cuda.amp import autocast, GradScaler
 
 from model import MobileNetV2UNet
-from cityscapes_dataset import (
-    CityscapesDataset,
-    NUM_CLASSES,
-    CLASS_NAMES,
-    IGNORE_INDEX,
-    build_label_index_cityscapes,
-)
-from partition import dirichlet_partition, print_partition_stats
+from dataset import CamVidDataset, NUM_CLASSES, CLASS_NAMES
+from partition import build_label_index, dirichlet_partition, print_partition_stats
 
 import os
 import sys
@@ -93,11 +79,9 @@ RECLUSTER_INTERVAL  = 10   # 动态重聚类间隔：每隔 M 轮重新聚类一
 # 重聚类后簇模型融合比例：新簇模型 = α × 全局模型 + (1-α) × 当前簇模型
 # α=0 完全保留原簇模型；α=1 等同于硬重置；推荐 0.2~0.4
 RECLUSTER_ALPHA     = 0.3
-# PCA 目标维度：固定为 2 维
-# 2 维的优势：
-#   1. 参数数量极少（GMM 每部件只需 2+2+1=5 个参数），10个样本下不会奇异
-#   2. 可直接生成 2D 散点图，直观展示客户端聚类分布，适合放入论文
-PCA_N_COMPONENTS    = 2     # 固定 2 维，保证 GMM 数值稳定
+# PCA 目标维度：降维后的特征维度，需满足 PCA_N_COMPONENTS < min(NUM_CLIENTS, feat_dim)
+# 推荐范围：[NUM_CLUSTERS, NUM_CLIENTS - 1]，默认取 NUM_CLIENTS // 2
+PCA_N_COMPONENTS    = None  # None = 自动设置为 min(NUM_CLIENTS-1, 8)
 
 
 # ==================== 显存监控工具 ====================
@@ -129,59 +113,44 @@ def print_gpu_status(device, label=""):
           f"利用率 {info['utilization_pct']:.1f}%")
 
 
-def auto_batch_size(device, num_data_per_client, base_batch_size=8):
-    """
-    Cityscapes 图像尺寸为 (512, 1024)，显存占用远大于 CamVid (256, 256)，
-    因此 base_batch_size 默认调低为 8，每张图约占 ~100MB 显存。
-    """
-    data_limit = max(4, num_data_per_client // 4)
+def auto_batch_size(device, num_data_per_client, base_batch_size=32):
+    data_limit = max(8, num_data_per_client // 2)
     if torch.cuda.is_available():
         total     = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
-        # Cityscapes 512×1024 每张约占 100MB（含梯度），保留 1GB 余量
-        gpu_limit = int((total - 1000) / 100)
-        gpu_limit = max(2, gpu_limit)
+        gpu_limit = int((total - 500 - 200) / 25)
+        gpu_limit = max(8, gpu_limit)
     else:
         gpu_limit = base_batch_size
     recommended = min(data_limit, gpu_limit)
     power = 1
     while power * 2 <= recommended:
         power *= 2
-    return max(2, power)
+    return max(4, power)
 
 
 # ==================== 评估指标 ====================
 
-def compute_pixel_accuracy(pred, target, ignore_index=IGNORE_INDEX):
-    """计算像素准确率，忽略 void 类（ignore_index=255）"""
-    valid_mask = (target != ignore_index)
-    if valid_mask.sum() == 0:
-        return 0.0
-    correct = ((pred == target) & valid_mask).sum().item()
-    total   = valid_mask.sum().item()
-    return correct / total
+def compute_pixel_accuracy(pred, target):
+    return (pred == target).sum().item() / target.numel()
 
 
-def compute_iou_per_class(pred, target, num_classes, ignore_index=IGNORE_INDEX):
-    """计算各类别 IoU，忽略 void 类"""
+def compute_iou_per_class(pred, target, num_classes):
     ious = []
-    valid_mask = (target != ignore_index)
     for cls in range(num_classes):
-        pred_c   = (pred  == cls) & valid_mask
-        target_c = (target == cls) & valid_mask
-        inter = (pred_c & target_c).sum().item()
-        union = (pred_c | target_c).sum().item()
+        inter = ((pred == cls) & (target == cls)).sum().item()
+        union = ((pred == cls) | (target == cls)).sum().item()
         ious.append(inter / union if union > 0 else float('nan'))
     return ious
 
 
-def compute_miou(pred, target, num_classes, ignore_index=IGNORE_INDEX):
-    ious  = compute_iou_per_class(pred, target, num_classes, ignore_index)
+def compute_miou(pred, target, num_classes):
+    ious = compute_iou_per_class(pred, target, num_classes)
     valid = [v for v in ious if not np.isnan(v)]
     return float(np.mean(valid)) if valid else 0.0
 
 
 def evaluate_model(model, val_loader, device, use_amp=True):
-    """返回 (avg_pixel_acc, avg_miou)，评估时忽略 void 类（trainId=255）"""
+    """返回 (avg_pixel_acc, avg_miou)"""
     model.eval()
     total_pa, total_miou, n = 0.0, 0.0, 0
     with torch.no_grad():
@@ -217,13 +186,29 @@ def extract_bn_feature(state_dict):
 def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_dir,
                        cluster_log, prev_assignments=None):
     """
-    提取 BN 特征 → 标准化 → PCA 降维（2维）→ 拟合 GMM → 分配客户端到簇。
+    提取 BN 特征 → 标准化 → PCA 降维 → 拟合 GMM → 分配客户端到簇。
 
-    PCA 固定降到 2 维的原因：
-      - 10 个客户端样本下，高维 GMM 协方差矩阵奇异，后验概率退化为 0/1
-      - 2 维时 GMM 每部件只需 5 个参数，10 个样本足够支撑稳定拟合
-      - 2 维可直接生成散点图，直观展示客户端聚类分布
-    K-Means++ 兜底：若 GMM 全部失败，自动切换为 K-Means++ 硬分配。
+    高维 BN 特征（维度通常远大于客户端数）直接送入 GMM 会导致后验概率
+    退化为 0/1（硬分配），失去概率软分配的意义。
+    解决方案：先用 StandardScaler 标准化，再用 PCA 将特征压缩到
+    PCA_N_COMPONENTS 维（默认 min(N-1, 8)），使特征维度远小于客户端数，
+    从而让 GMM 的高斯分布保持合理的宽度，后验概率恢复为有意义的软分配。
+
+    参数
+    ----
+    local_weights    : 本轮各客户端训练后的 state_dict 列表
+    num_clients      : 客户端总数
+    n_clusters       : GMM 部件数
+    round_idx        : 当前轮次索引（0-based），用于日志
+    run_dir          : 结果保存目录
+    cluster_log      : 聚类日志列表（原地追加）
+    prev_assignments : 上一次的分配结果，用于检测分配变化
+
+    返回
+    ----
+    new_assignments  : list[int]，新的客户端分簇结果
+    changed          : bool，分配结果是否发生变化
+    posteriors       : ndarray (N, K)，后验概率矩阵（基于降维后特征）
     """
     print(f"\n  [GMM] 提取 BN 层统计特征（Round {round_idx + 1}）...")
     features = [extract_bn_feature(w) for w in local_weights]
@@ -234,102 +219,79 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
     N = X.shape[0]
     effective_k = min(n_clusters, N)
 
-    # ---- Step 1: 标准化 ----
-    scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    # ---- Step 1: 标准化（消除不同 BN 层数值尺度差异）----
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)   # (N, D)
 
-    # ---- Step 2: PCA 降维（固定 2 维）----
-    # 2 维保证 GMM 数值稳定，且可生成 2D 散点图
-    n_components = max(2, min(PCA_N_COMPONENTS, N - 1, feat_dim))
+    # ---- Step 2: PCA 降维 ----
+    # 目标维度：需满足 n_components < min(N, D)
+    # 为避免协方差奇异，将维度限制在 [n_clusters, min(N//2, 5)] 之间
+    # 维度越低，各样本对高斯分布的覆盖越充分，协方差矩阵越稳定
+    if PCA_N_COMPONENTS is not None:
+        n_components = PCA_N_COMPONENTS
+    else:
+        # 默认：min(N//2, 5)，但不小于簇数，不大于 N-1
+        n_components = min(N // 2, 5)
+    n_components = max(effective_k, min(n_components, N - 1, feat_dim))
 
-    pca   = PCA(n_components=n_components, random_state=42)
+    pca = PCA(n_components=n_components, random_state=42)
+    # 强制 float64：避免 float32 导致协方差矩阵数値不稳定
     X_pca = pca.fit_transform(X_scaled).astype(np.float64)
 
     explained_var = pca.explained_variance_ratio_.sum() * 100
     print(f"  [GMM] PCA 降维: {feat_dim} → {n_components} 维 "
           f"（累计解释方差: {explained_var:.1f}%）")
 
-    # ---- Step 3: 拟合 GMM（full 协方差，2维下完全可行）----
-    def _fit_gmm(X_data, k, reg, cov_type='full'):
+    # ---- Step 3: 拟合 GMM ----
+    # 使用 'diag' 协方差：在小样本场景下比 'full' 更稳定，不易出现奇异
+    # reg_covar 设为 1e-2，充分正则化协方差矩阵对角元素
+    def _fit_gmm(X_data, k, reg):
         gmm = GaussianMixture(
             n_components=k,
-            covariance_type=cov_type,
-            max_iter=500,
-            n_init=10,          # 10次随机初始化选最优，避免局部最优
+            covariance_type='diag',
+            max_iter=300,
+            n_init=5,
             random_state=None,
             reg_covar=reg,
         )
         gmm.fit(X_data)
         return gmm
 
-    # 2维下优先用 full 协方差，更准确；失败时退化到 diag，最后兜底 KMeans++
-    reg_list = [1e-3, 1e-2, 1e-1, 0.5, 1.0]
+    # 逐步升高 reg_covar 直到成功，最多尝试 5 次
+    reg_list = [1e-2, 1e-1, 0.5, 1.0, 2.0]
     gmm = None
     for reg in reg_list:
-        for cov_type in ['full', 'diag']:
-            try:
-                gmm = _fit_gmm(X_pca, effective_k, reg, cov_type)
-                print(f"  [GMM] 拟合成功 (covariance_type={cov_type}, reg_covar={reg})")
-                break
-            except (ValueError, np.linalg.LinAlgError) as e:
-                pass
-        if gmm is not None:
+        try:
+            gmm = _fit_gmm(X_pca, effective_k, reg)
+            print(f"  [GMM] 拟合成功 (reg_covar={reg})")
             break
-
-    def _save_scatter(X_2d, labels, posteriors_2d, method_name, run_dir, round_idx):
-        """生成 2D 聚类散点图，每次聚类时保存。"""
-        if X_2d.shape[1] != 2:
-            return
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        colors = ['#e74c3c', '#2ecc71', '#3498db', '#f39c12', '#9b59b6']
-        fig, ax = plt.subplots(figsize=(7, 6))
-        for k in range(effective_k):
-            idx = [i for i, c in enumerate(labels) if c == k]
-            if idx:
-                ax.scatter(X_2d[idx, 0], X_2d[idx, 1],
-                           c=colors[k % len(colors)], s=120,
-                           label=f'Cluster {k}', zorder=3, edgecolors='white', linewidths=0.8)
-        # 标注客户端编号
-        for i in range(len(labels)):
-            ax.annotate(f'C{i}', (X_2d[i, 0], X_2d[i, 1]),
-                        textcoords='offset points', xytext=(6, 4), fontsize=9)
-        ax.set_xlabel('PC 1', fontsize=11)
-        ax.set_ylabel('PC 2', fontsize=11)
-        ax.set_title(f'Client Clustering (Round {round_idx + 1}, {method_name})', fontsize=12)
-        ax.legend(fontsize=10)
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        scatter_path = os.path.join(run_dir, f'cluster_scatter_round{round_idx + 1}.png')
-        fig.savefig(scatter_path, dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        print(f"  [GMM] 聚类散点图已保存: {scatter_path}")
-
+        except (ValueError, np.linalg.LinAlgError) as e:
+            print(f"  [GMM] reg_covar={reg} 拟合失败，尝试加大正则化系数... ({e})")
     if gmm is None:
-        # K-Means++ 兜底
-        print("  [GMM] 警告：GMM 全部失败，降级为 KMeans++ 硬分配")
+        # 最后降级处理：用 KMeans 硬分配替代 GMM
+        print("  [GMM] 警告：GMM 全部失败，降级为 KMeans 硬分配")
         from sklearn.cluster import KMeans
-        km = KMeans(n_clusters=effective_k, init='k-means++', n_init=20, random_state=None)
+        km = KMeans(n_clusters=effective_k, n_init=10, random_state=42)
         km.fit(X_pca)
-        hard_labels  = km.labels_
-        posteriors   = np.zeros((N, effective_k), dtype=np.float64)
+        hard_labels = km.labels_
+        # 构造伪后验概率矩阵（硬分配）
+        posteriors = np.zeros((N, effective_k), dtype=np.float64)
         posteriors[np.arange(N), hard_labels] = 1.0
         new_assignments = hard_labels.tolist()
         changed = (prev_assignments is None) or (new_assignments != prev_assignments)
-        print(f"  [KMeans++] 分簇结果: {new_assignments}")
-        _save_scatter(X_pca, new_assignments, posteriors, 'KMeans++', run_dir, round_idx)
+        print(f"  [GMM/KMeans 降级] 分簇结果: {new_assignments}")
+        # 跳过后续正常流程
         cluster_log.append({
-            'round':                 round_idx + 1,
-            'trigger':               'warmup_end' if prev_assignments is None else 'recluster',
-            'method':                'kmeans_fallback',
-            'feature_dim_raw':       int(feat_dim),
-            'feature_dim_pca':       int(n_components),
+            'round':            round_idx + 1,
+            'trigger':          'warmup_end' if prev_assignments is None else 'recluster',
+            'method':           'kmeans_fallback',
+            'feature_dim_raw':  int(feat_dim),
+            'feature_dim_pca':  int(n_components),
             'pca_explained_var_pct': round(float(explained_var), 2),
-            'assignments':           new_assignments,
-            'changed':               changed,
-            'posteriors':            posteriors.tolist(),
-            'cluster_members':       {
+            'assignments':      new_assignments,
+            'changed':          changed,
+            'posteriors':       posteriors.tolist(),
+            'cluster_members':  {
                 str(k): [i for i, c in enumerate(new_assignments) if c == k]
                 for k in range(effective_k)
             },
@@ -339,33 +301,16 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
             json.dump(cluster_log, f, ensure_ascii=False, indent=2)
         return new_assignments, changed, posteriors
 
-    posteriors      = gmm.predict_proba(X_pca)
-    new_assignments = posteriors.argmax(axis=1).tolist()
+    posteriors       = gmm.predict_proba(X_pca)       # (N, K)
+    new_assignments  = posteriors.argmax(axis=1).tolist()
+
+    # 检测分配变化
     changed = (prev_assignments is None) or (new_assignments != prev_assignments)
 
-    # 检查后验概率是否仍然退化（最大概率均 > 0.99 视为退化）
-    max_probs = posteriors.max(axis=1)
-    if (max_probs > 0.99).all():
-        print("  [GMM] 警告：后验概率仍退化为 0/1，自动切换为 KMeans++ 硬分配")
-        from sklearn.cluster import KMeans
-        km = KMeans(n_clusters=effective_k, init='k-means++', n_init=20, random_state=None)
-        km.fit(X_pca)
-        hard_labels  = km.labels_
-        posteriors   = np.zeros((N, effective_k), dtype=np.float64)
-        posteriors[np.arange(N), hard_labels] = 1.0
-        new_assignments = hard_labels.tolist()
-        changed = (prev_assignments is None) or (new_assignments != prev_assignments)
-        method_used = 'kmeans_fallback'
-        print(f"  [KMeans++] 分簇结果: {new_assignments}")
-    else:
-        method_used = 'gmm'
-        print(f"  [GMM] 后验概率正常（最大概率范围: {max_probs.min():.3f} ~ {max_probs.max():.3f}）")
-
-    label_str = '首次' if prev_assignments is None else '重聚类'
-    print(f"  [GMM] 客户端分簇结果（{label_str}，方法: {method_used}）:")
+    print(f"  [GMM] 客户端分簇结果（{'首次' if prev_assignments is None else '重聚类'}）:")
     for i, k in enumerate(new_assignments):
-        prob_str   = ', '.join([f'C{j}:{posteriors[i, j]:.3f}'
-                                for j in range(posteriors.shape[1])])
+        prob_str = ', '.join([f'C{j}:{posteriors[i, j]:.3f}'
+                              for j in range(posteriors.shape[1])])
         change_tag = ''
         if prev_assignments is not None and new_assignments[i] != prev_assignments[i]:
             change_tag = f'  ← 从 Cluster {prev_assignments[i]} 迁移'
@@ -378,25 +323,23 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
     if not changed:
         print(f"  [GMM] 分配结果与上次相同，无需重置簇模型。")
 
-    # 生成 2D 聚类散点图
-    _save_scatter(X_pca, new_assignments, posteriors, method_used.upper(), run_dir, round_idx)
-
+    # 追加到聚类日志
     cluster_log.append({
-        'round':                 round_idx + 1,
-        'trigger':               'warmup_end' if prev_assignments is None else 'recluster',
-        'method':                method_used,
-        'feature_dim_raw':       int(feat_dim),
-        'feature_dim_pca':       int(n_components),
+        'round':            round_idx + 1,
+        'trigger':          'warmup_end' if prev_assignments is None else 'recluster',
+        'feature_dim_raw':  int(feat_dim),
+        'feature_dim_pca':  int(n_components),
         'pca_explained_var_pct': round(float(explained_var), 2),
-        'assignments':           new_assignments,
-        'changed':               changed,
-        'posteriors':            posteriors.tolist(),
-        'cluster_members':       {
+        'assignments':      new_assignments,
+        'changed':          changed,
+        'posteriors':       posteriors.tolist(),
+        'cluster_members':  {
             str(k): [i for i, c in enumerate(new_assignments) if c == k]
             for k in range(effective_k)
         },
     })
 
+    # 实时写入聚类日志 JSON
     log_path = os.path.join(run_dir, 'gmm_cluster_log.json')
     with open(log_path, 'w', encoding='utf-8') as f:
         json.dump(cluster_log, f, ensure_ascii=False, indent=2)
@@ -411,11 +354,24 @@ def interpolate_models(cluster_model, global_model, alpha):
     """
     将簇模型与全局模型做加权插值：
         新簇模型参数 = α × 全局模型参数 + (1 - α) × 当前簇模型参数
+
+    参数
+    ----
+    cluster_model : 当前簇模型（原地修改并返回）
+    global_model  : 全局模型（只读）
+    alpha         : 全局模型权重，范围 [0, 1]
+                    0 = 完全保留簇模型；1 = 等同于硬重置为全局模型
+
+    说明
+    ----
+    相比硬重置，插值融合保留了原簇积累的特定知识，同时向全局模型靠拢，
+    使重聚类后的性能曲线平滑过渡，避免跳跃式下降。
     """
     cluster_sd = cluster_model.state_dict()
     global_sd  = global_model.state_dict()
     blended    = {}
     for key in cluster_sd:
+        # 仅对浮点参数做插值；整型参数（如 num_batches_tracked）直接取全局值
         if cluster_sd[key].is_floating_point():
             blended[key] = (1.0 - alpha) * cluster_sd[key] + alpha * global_sd[key]
         else:
@@ -428,7 +384,7 @@ def interpolate_models(cluster_model, global_model, alpha):
 
 def fedavg(base_model, weights_list, lens_list):
     """按数据量加权平均聚合，结果写入 base_model 并返回。"""
-    total       = sum(lens_list)
+    total = sum(lens_list)
     global_dict = copy.deepcopy(weights_list[0])
     for key in global_dict:
         global_dict[key] = global_dict[key] * (lens_list[0] / total)
@@ -450,7 +406,7 @@ class Client:
         self.dataset   = dataset
         self.indices   = indices
 
-    def local_train(self, model, batch_size=4, epochs=1, lr=0.01,
+    def local_train(self, model, batch_size=16, epochs=1, lr=0.01,
                     num_workers=0, pin_memory=False):
         loader = DataLoader(
             Subset(self.dataset, self.indices),
@@ -464,8 +420,7 @@ class Client:
         model.train()
         model.to(self.device)
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
-        # Cityscapes 有 void 类（trainId=255），必须设置 ignore_index
-        criterion = torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+        criterion = torch.nn.CrossEntropyLoss()
         scaler    = GradScaler(enabled=self.use_amp)
 
         epoch_losses = []
@@ -541,18 +496,20 @@ def save_curves(cluster_history, global_history, num_clusters, warmup_rounds, ru
 
     for ylabel, title, suffix, c_key, g_data in [
         ('Pixel Accuracy',
-         'Cityscapes — Pixel Accuracy per Cluster & Global vs. Round',
+         'Pixel Accuracy per Cluster & Global vs. Round',
          'pixel_accuracy.png', 'pa', global_pa),
         ('mIoU',
-         'Cityscapes — mIoU per Cluster & Global vs. Round',
+         'mIoU per Cluster & Global vs. Round',
          'miou.png', 'miou', global_miou),
     ]:
         plt.figure(figsize=(13, 6))
 
+        # 热身期与分簇期分隔线
         if warmup_rounds > 0 and global_rounds and warmup_rounds < max(global_rounds):
             plt.axvline(x=warmup_rounds + 0.5, color='gray', linestyle=':', linewidth=1.5,
                         label=f'Warmup End (R{warmup_rounds})')
 
+        # 各簇曲线（虚线，仅分簇期有数据）
         for k in range(num_clusters):
             d = cluster_data[k]
             if d['rounds']:
@@ -561,6 +518,7 @@ def save_curves(cluster_history, global_history, num_clusters, warmup_rounds, ru
                          color=colors[k % len(colors)],
                          label=f'Cluster {k}')
 
+        # 全局曲线（实线，加粗，贯穿全程）
         if global_rounds:
             plt.plot(global_rounds, g_data,
                      linestyle='-', marker='s', linewidth=2.5, markersize=4,
@@ -596,73 +554,42 @@ def main():
     from torchvision import transforms
 
     # ==================== 配置区 ====================
-    # Cityscapes 数据集根目录（包含 leftImg8bit/ 和 gtFine/ 两个子目录）
-    DATASET_ROOT = r'E:\Autonomous Driving Dataset\Cityscapes dataset(10g)'
-
     USE_AMP      = True
-    # Cityscapes 原始分辨率为 1024×2048；推荐使用 (512, 1024) 保持宽高比 1:2
-    # 4060 Ti 8GB 建议使用 (256, 512)，可用 BATCH_SIZE=4，速度与显存均衡
-    # 若租用 16GB+ 显卡（如 RTX 4080/4090），可改回 (512, 1024)，BATCH_SIZE=8~16
-    TARGET_SIZE  = (256, 512)
-    NUM_ROUNDS   = 100
-    NUM_CLIENTS  = 20
-    LOCAL_EPOCHS = 1        # 联邦学习标准设置；通过增加通信轮数补偿
+    TARGET_SIZE  = (256, 256)
+    NUM_ROUNDS   = 50
+    NUM_CLIENTS  = 10
+    LOCAL_EPOCHS = 5
     LR           = 0.01
     NUM_WORKERS  = 0 if sys.platform == 'win32' else 4
     PIN_MEMORY   = True
-    BATCH_SIZE   = 4        # 4060 Ti 8GB + 256×512 图像，AMP 下每张约 10MB，4张共 40MB
+    BATCH_SIZE   = 0        # 0 = 自动推荐
     DIRICHLET_ALPHA = 1.0   # Dirichlet 浓度参数（越小异质性越强；推荐 0.5/1.0/2.0）
-    MIN_SAMPLES     = 100   # 每个客户端最少图像数量（Cityscapes 共 2974 张，每人约 149 张）
-    MAX_SAMPLES     = 200   # 每个客户端最多图像数量（限制数据量过多的客户端，加快每轮训练）
-                            # 设为 None 则不限制
+    MIN_SAMPLES     = 20    # 每个客户端最少图像数量
     # ================================================
 
     # ===== 时间戳运行目录 =====
     run_timestamp = datetime.now().strftime('%m%d%H%M')
-    run_dir = os.path.join('./result_save', f'FedGMHC_{run_timestamp}')
+    run_dir = os.path.join('../result_save', f'FedGMHC_{run_timestamp}')
     os.makedirs(run_dir, exist_ok=True)
     print(f"\n本次运行结果将保存至: {run_dir}/")
 
-    # ===== 加载 Cityscapes 数据集 =====
-    print(f"\n正在加载 Cityscapes 数据集（路径: {DATASET_ROOT}）...")
-    train_dataset = CityscapesDataset(
-        root_dir=DATASET_ROOT,
-        split='train',
-        transform=transforms.ToTensor(),
-        target_size=TARGET_SIZE,
-    )
-    val_dataset = CityscapesDataset(
-        root_dir=DATASET_ROOT,
-        split='val',
-        transform=transforms.ToTensor(),
-        target_size=TARGET_SIZE,
-    )
+    # ===== 加载数据集 =====
+    train_dataset = CamVidDataset('./data/Camvid', split='train',
+                                  transform=transforms.ToTensor(),
+                                  target_size=TARGET_SIZE)
+    val_dataset   = CamVidDataset('./data/Camvid', split='val',
+                                  transform=transforms.ToTensor(),
+                                  target_size=TARGET_SIZE)
 
     num_images = len(train_dataset)
 
     # ===== Dirichlet Non-IID 数据划分 =====
     print(f"\n  [Partition] 使用 Dirichlet(α={DIRICHLET_ALPHA}) Non-IID 划分...")
-    labels = build_label_index_cityscapes(
-        DATASET_ROOT, split='train',
-        num_classes=NUM_CLASSES,
-        target_size=TARGET_SIZE,
-    )
+    labels = build_label_index('./data/Camvid', split='train', num_classes=NUM_CLASSES,
+                               target_size=TARGET_SIZE)
     user_groups = dirichlet_partition(
         num_clients=NUM_CLIENTS, labels=labels, num_classes=NUM_CLASSES,
-        alpha=DIRICHLET_ALPHA, min_samples=MIN_SAMPLES, seed=42,
-    )
-    # ===== 截断超出 MAX_SAMPLES 限制的客户端数据 =====
-    if MAX_SAMPLES is not None:
-        import random as _random
-        _random.seed(42)
-        clipped = 0
-        for i in range(len(user_groups)):
-            if len(user_groups[i]) > MAX_SAMPLES:
-                user_groups[i] = _random.sample(list(user_groups[i]), MAX_SAMPLES)
-                clipped += 1
-        if clipped > 0:
-            print(f"  [Partition] MAX_SAMPLES={MAX_SAMPLES}: {clipped} 个客户端数据被截断")
-
+        alpha=DIRICHLET_ALPHA, min_samples=MIN_SAMPLES, seed=42)
     print_partition_stats(user_groups, labels, NUM_CLASSES, CLASS_NAMES)
 
     min_data = min(len(g) for g in user_groups)
@@ -670,13 +597,9 @@ def main():
         BATCH_SIZE = auto_batch_size(device, min_data)
 
     print(f"\n{'='*65}")
-    print(f"训练配置（Cityscapes）:")
-    print(f"  数据集根目录: {DATASET_ROOT}")
-    print(f"  图像尺寸: {TARGET_SIZE[0]}×{TARGET_SIZE[1]}  |  训练类别: {NUM_CLASSES}  |  IGNORE_INDEX: {IGNORE_INDEX}")
+    print(f"训练配置:")
     print(f"  训练集: {num_images} 张 | 验证集: {len(val_dataset)} 张")
-    max_data = max(len(g) for g in user_groups)
-    _max_str = f' | 最多 {MAX_SAMPLES} 张/客户端' if MAX_SAMPLES is not None else ''
-    print(f"  客户端: {NUM_CLIENTS} 个 | 簇数: {NUM_CLUSTERS} | Dirichlet α={DIRICHLET_ALPHA} | 最少 {min_data} 张{_max_str}")
+    print(f"  客户端: {NUM_CLIENTS} 个 | 簇数: {NUM_CLUSTERS} | Dirichlet α={DIRICHLET_ALPHA} | 最少 {min_data} 张/客户端")
     _recluster_str = '禁用' if RECLUSTER_INTERVAL == 0 else f'每 {RECLUSTER_INTERVAL} 轮'
     print(f"  热身轮数: {WARMUP_ROUNDS} | 重聚类间隔: {_recluster_str}")
     print(f"  Batch Size: {BATCH_SIZE} | Local Epochs: {LOCAL_EPOCHS} | 联邦轮数: {NUM_ROUNDS}")
@@ -688,12 +611,10 @@ def main():
     total_params = sum(p.numel() for p in global_model.parameters())
     print(f"\n模型总参数量: {total_params:,} ({total_params * 4 / 1024**2:.1f} MB in FP32)")
 
-    val_loader = DataLoader(
-        val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
-    )
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
 
-    save_dir = './checkpoints'
+    save_dir = '../checkpoints'
     os.makedirs(save_dir, exist_ok=True)
 
     if torch.cuda.is_available():
@@ -701,10 +622,10 @@ def main():
     print_gpu_status(device, "训练前基线")
 
     # ===== 状态变量 =====
-    cluster_models     = [copy.deepcopy(global_model) for _ in range(NUM_CLUSTERS)]
-    client_cluster     = None   # 当前分簇结果，None 表示热身期
-    last_cluster_round = -1     # 上次执行聚类的轮次索引
-    cluster_log        = []     # 每次聚类的详细记录
+    cluster_models  = [copy.deepcopy(global_model) for _ in range(NUM_CLUSTERS)]
+    client_cluster  = None          # 当前分簇结果，None 表示热身期
+    last_cluster_round = -1         # 上次执行聚类的轮次索引
+    cluster_log     = []            # 每次聚类的详细记录
 
     cluster_history = []
     global_history  = []
@@ -712,9 +633,8 @@ def main():
     total_time      = 0.0
 
     print(f"\n{'='*80}")
-    print(f"开始 FedGMHC 训练（Cityscapes）")
-    print(f"热身 {WARMUP_ROUNDS} 轮 + 动态重聚类间隔 "
-          f"{'禁用' if RECLUSTER_INTERVAL == 0 else RECLUSTER_INTERVAL} 轮")
+    print(f"开始 FedGMHC 训练（热身 {WARMUP_ROUNDS} 轮 + 动态重聚类间隔 "
+          f"{'禁用' if RECLUSTER_INTERVAL == 0 else RECLUSTER_INTERVAL} 轮）...")
     print(f"{'='*80}")
 
     for round_idx in range(NUM_ROUNDS):
@@ -725,6 +645,8 @@ def main():
 
         # ================================================================
         # 阶段 A：每个客户端本地训练
+        #   热身期：从全局模型出发
+        #   分簇期：从所属簇模型出发
         # ================================================================
         local_weights = []
         local_losses  = []
@@ -762,6 +684,7 @@ def main():
         # ================================================================
         if is_warmup:
             global_model = fedavg(global_model, local_weights, local_lens)
+            # 热身期簇模型始终与全局模型保持同步
             for k in range(NUM_CLUSTERS):
                 cluster_models[k].load_state_dict(copy.deepcopy(global_model.state_dict()))
 
@@ -787,7 +710,7 @@ def main():
             should_recluster  = (
                 RECLUSTER_INTERVAL > 0
                 and rounds_since_last >= RECLUSTER_INTERVAL
-                and round_idx > WARMUP_ROUNDS - 1
+                and round_idx > WARMUP_ROUNDS - 1   # 不在热身期末尾重复聚类
             )
 
             if should_recluster:
@@ -798,6 +721,9 @@ def main():
                     prev_assignments=client_cluster,
                 )
                 if changed:
+                    # 分配发生变化：对有新成员迁入的簇，采用插值融合而非硬重置，
+                    # 避免性能曲线出现跳跃式下降。
+                    # 新簇模型 = RECLUSTER_ALPHA × 全局模型 + (1-RECLUSTER_ALPHA) × 当前簇模型
                     changed_clusters = set()
                     for i in range(NUM_CLIENTS):
                         if new_assignments[i] != client_cluster[i]:
@@ -845,12 +771,14 @@ def main():
         # ================================================================
         # 阶段 E：验证
         # ================================================================
+        # 各簇模型验证（分簇期才有意义；热身期也记录，便于对比）
         for k in range(NUM_CLUSTERS):
             if client_cluster is not None:
                 members   = [i for i, c in enumerate(client_cluster) if c == k]
                 n_samples = sum(local_lens[i] for i in members)
                 k_loss    = float(np.mean([local_losses[i] for i in members])) if members else avg_loss
             else:
+                # 热身期：簇模型与全局模型相同，均匀分配
                 members   = list(range(NUM_CLIENTS))
                 n_samples = sum(local_lens)
                 k_loss    = avg_loss
@@ -870,7 +798,7 @@ def main():
             print(f"  [Cluster {k}] Pixel Acc: {pa:.4f} | mIoU: {miou:.4f} | 成员: {member_str}")
 
         # 全局模型验证
-        round_time  = time.time() - round_start
+        round_time = time.time() - round_start
         total_time += round_time
 
         g_pa, g_miou = evaluate_model(global_model, val_loader, device, use_amp=USE_AMP)
@@ -885,6 +813,7 @@ def main():
         print(f"  [Global]    Pixel Acc: {g_pa:.4f} | mIoU: {g_miou:.4f} | 耗时: {round_time:.1f}s",
               end="")
 
+        # 保存最优全局模型
         if g_miou > best_miou:
             best_miou = g_miou
             torch.save({
@@ -893,23 +822,20 @@ def main():
                 'num_classes':      NUM_CLASSES,
                 'pixel_acc':        g_pa,
                 'miou':             g_miou,
-                'dataset':          'cityscapes',
-                'target_size':      TARGET_SIZE,
-            }, os.path.join(save_dir, 'best_model_cityscapes.pth'))
+            }, os.path.join(save_dir, 'best_model.pth'))
             print(f"  ★ Best (mIoU: {g_miou:.4f})")
         else:
             print()
 
+        # 每 10 轮保存检查点
         if (round_idx + 1) % 10 == 0:
-            ckpt = os.path.join(save_dir, f'global_model_cityscapes_round_{round_idx + 1}.pth')
+            ckpt = os.path.join(save_dir, f'global_model_round_{round_idx + 1}.pth')
             torch.save({
                 'round':            round_idx + 1,
                 'model_state_dict': global_model.state_dict(),
                 'num_classes':      NUM_CLASSES,
                 'pixel_acc':        g_pa,
                 'miou':             g_miou,
-                'dataset':          'cityscapes',
-                'target_size':      TARGET_SIZE,
             }, ckpt)
             print(f"  >> 检查点已保存: {ckpt}")
 
@@ -918,15 +844,13 @@ def main():
         save_global_csv(global_history, run_dir)
 
     # ===== 保存最终全局模型 =====
-    final_path = os.path.join(save_dir, 'global_model_cityscapes_final.pth')
+    final_path = os.path.join(save_dir, 'global_model_final.pth')
     torch.save({
         'model_state_dict': global_model.state_dict(),
         'num_classes':      NUM_CLASSES,
         'num_rounds':       NUM_ROUNDS,
         'final_pixel_acc':  global_history[-1]['pixel_acc'],
         'final_miou':       global_history[-1]['miou'],
-        'dataset':          'cityscapes',
-        'target_size':      TARGET_SIZE,
     }, final_path)
 
     # ===== 生成折线图 =====
@@ -936,7 +860,7 @@ def main():
 
     # ===== 打印训练总结 =====
     print(f"\n{'='*80}")
-    print(f"训练完成！总结如下（Cityscapes）：")
+    print(f"训练完成！总结如下：")
     print(f"{'='*80}")
 
     if torch.cuda.is_available():
@@ -966,7 +890,7 @@ def main():
     print(f"  ├── global_val_results.csv    ← 每轮全局模型验证数据")
     print(f"  ├── pixel_accuracy.png        ← Pixel Accuracy 折线图")
     print(f"  └── miou.png                  ← mIoU 折线图")
-    print(f"\n最优模型: {os.path.join(save_dir, 'best_model_cityscapes.pth')}")
+    print(f"\n最优模型: {os.path.join(save_dir, 'best_model.pth')}")
     print(f"最终模型: {final_path}")
 
 
