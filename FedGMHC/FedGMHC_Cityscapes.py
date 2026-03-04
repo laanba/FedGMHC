@@ -93,7 +93,7 @@ from sklearn.preprocessing import StandardScaler
 # ==================== 超参数 ====================
 NUM_CLUSTERS        = 3    # GMM 部件数 / 簇数
 WARMUP_ROUNDS       = 5    # 热身轮数：前 N 轮执行标准 FedAvg，之后再首次聚类
-RECLUSTER_INTERVAL  = 10   # 动态重聚类间隔：每隔 M 轮重新聚类一次（0 = 禁用重聚类）
+RECLUSTER_INTERVAL  = 5    # 动态重聚类间隔：每隔 5 轮重新聚类一次（0 = 禁用重聚类）
 # 重聚类后簇模型融合比例：新簇模型 = α × 全局模型 + (1-α) × 当前簇模型
 # α=0 完全保留原簇模型；α=1 等同于硬重置；推荐 0.2~0.4
 RECLUSTER_ALPHA     = 0.3
@@ -602,7 +602,7 @@ def main():
 
     if DEBUG_MODE:
         NUM_ROUNDS      = 20    # 快速模式：20轮（全量 50 轮）
-        NUM_CLIENTS     = 10
+        NUM_CLIENTS     = 20    # 增加到 20 个客户端，增大 GMM 样本量，改善软分簇效果
         LOCAL_EPOCHS    = 1
         LR              = 0.01
         BATCH_SIZE      = 8
@@ -610,10 +610,10 @@ def main():
         MIN_SAMPLES     = 30    # 每客户端最少 30 张
         MAX_SAMPLES     = 50    # 每客户端最多 50 张（大幅缩短每轮训练时间）
         EVAL_EVERY      = 2     # 每 2 轮验证一次（节省验证时间）
-        print("[DEBUG MODE] 快速调试模式已开启：20轮 / MAX_SAMPLES=50 / 每2轮验证")
+        print("[DEBUG MODE] 快速调试模式已开启：20轮 / 20客户端 / MAX_SAMPLES=50 / 每2轮验证")
     else:
         NUM_ROUNDS      = 50    # 完整实验轮数
-        NUM_CLIENTS     = 10
+        NUM_CLIENTS     = 20    # 增加到 20 个客户端
         LOCAL_EPOCHS    = 1
         LR              = 0.01
         BATCH_SIZE      = 8
