@@ -569,6 +569,80 @@ def save_curves(cluster_history, global_history, num_clusters, warmup_rounds, ru
         print(f"  已保存: {save_path}")
 
 
+def save_intra_dist_curve(intra_dist_history, num_clusters, warmup_rounds, run_dir):
+    """
+    生成簇内平均距离（Intra-cluster Distance）随轮次变化的折线图。
+    用于论文中展示 FedGMHC 簇内内聚性随训练增强的证据。
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    rounds        = [r['round']         for r in intra_dist_history]
+    overall_intra = [r['overall_intra'] for r in intra_dist_history]
+
+    # 每个簇的单独曲线
+    per_cluster = {k: [] for k in range(num_clusters)}
+    per_rounds  = {k: [] for k in range(num_clusters)}
+    for r in intra_dist_history:
+        for k in range(num_clusters):
+            if k in r['per_cluster']:
+                per_cluster[k].append(r['per_cluster'][k])
+                per_rounds[k].append(r['round'])
+
+    colors = plt.cm.tab10.colors
+    fig, ax = plt.subplots(figsize=(13, 6))
+
+    # 热身期分隔线
+    if warmup_rounds > 0 and rounds and warmup_rounds < max(rounds):
+        ax.axvline(x=warmup_rounds + 0.5, color='gray', linestyle=':', linewidth=1.5,
+                   label=f'Warmup End (R{warmup_rounds})')
+
+    # 各簇单独曲线（分簇期才有意义）
+    for k in range(num_clusters):
+        if per_rounds[k]:
+            ax.plot(per_rounds[k], per_cluster[k],
+                    linestyle='--', marker='o', linewidth=1.5, markersize=3,
+                    color=colors[k % len(colors)], alpha=0.8,
+                    label=f'Cluster {k}')
+
+    # 整体平均曲线（黑色实线）
+    ax.plot(rounds, overall_intra,
+            linestyle='-', marker='s', linewidth=2.5, markersize=4,
+            color='black', label='Overall Mean')
+
+    ax.set_xlabel('Communication Round', fontsize=13)
+    ax.set_ylabel('Intra-cluster Distance (PCA 2D)', fontsize=13)
+    ax.set_title('FedGMHC — Intra-cluster Distance vs. Round\n'
+                 '(Decreasing trend indicates increasing intra-cluster cohesion)', fontsize=13)
+    ax.legend(fontsize=10, loc='upper right')
+    ax.grid(True, linestyle='--', alpha=0.6)
+    fig.tight_layout()
+
+    save_path = os.path.join(run_dir, 'intra_cluster_distance.png')
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  已保存: {save_path}")
+
+    # 同时保存 CSV
+    import csv
+    csv_path = os.path.join(run_dir, 'intra_cluster_distance.csv')
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        fieldnames = ['Round', 'Phase', 'Overall_Intra'] + [f'Cluster_{k}_Intra' for k in range(num_clusters)]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in intra_dist_history:
+            row = {
+                'Round':         r['round'],
+                'Phase':         r['phase'],
+                'Overall_Intra': round(r['overall_intra'], 6) if r['overall_intra'] is not None else '',
+            }
+            for k in range(num_clusters):
+                row[f'Cluster_{k}_Intra'] = round(r['per_cluster'].get(k, ''), 6) if k in r['per_cluster'] else ''
+            writer.writerow(row)
+    print(f"  已保存: {csv_path}")
+
+
 # ==================== 主函数 ====================
 
 def main():
@@ -716,10 +790,11 @@ def main():
     last_cluster_round = -1     # 上次执行聚类的轮次索引
     cluster_log        = []     # 每次聚类的详细记录
 
-    cluster_history = []
-    global_history  = []
-    best_miou       = 0.0
-    total_time      = 0.0
+    cluster_history    = []
+    global_history     = []
+    intra_dist_history = []   # 每轮簇内平均距离记录
+    best_miou          = 0.0
+    total_time         = 0.0
 
     print(f"\n{'='*80}")
     print(f"开始 FedGMHC 训练（Cityscapes）")
@@ -851,6 +926,45 @@ def main():
             if active_weights:
                 global_model = fedavg(global_model, active_weights, active_lens)
 
+        # ================================================================
+        # 阶段 D+: 计算并记录每轮簇内平均距离（用于可视化方法有效性）
+        # ================================================================
+        # 提取当前轮所有客户端的 BN 特征，标准化后做 PCA 降维
+        _feats = np.stack([extract_bn_feature(w) for w in local_weights], axis=0)  # (N, D)
+        _scaler = StandardScaler()
+        _feats_scaled = _scaler.fit_transform(_feats)
+        _n_comp = max(2, min(PCA_N_COMPONENTS, NUM_CLIENTS - 1, _feats_scaled.shape[1]))
+        _pca = PCA(n_components=_n_comp, random_state=42)
+        _X2d = _pca.fit_transform(_feats_scaled)  # (N, 2)
+
+        if client_cluster is not None and client_posteriors is not None:
+            # 分簇期：计算每个簇的加权内聚距离（用软权重加权平均）
+            cluster_intra = {}
+            for k in range(NUM_CLUSTERS):
+                # 簇中心：各客户端特征按软权重加权平均
+                weights_k = client_posteriors[:, k]          # (N,)
+                if weights_k.sum() < 1e-8:
+                    continue
+                center_k = np.average(_X2d, axis=0, weights=weights_k)  # (2,)
+                # 簇内平均距离：各客户端到簇中心的距离，按软权重加权平均
+                dists_k = np.linalg.norm(_X2d - center_k, axis=1)       # (N,)
+                intra_k = float(np.average(dists_k, weights=weights_k))
+                cluster_intra[k] = intra_k
+            overall_intra = float(np.mean(list(cluster_intra.values()))) if cluster_intra else None
+        else:
+            # 热身期：所有客户端当作一个簇，计算全局内聚距离
+            center_all = _X2d.mean(axis=0)
+            dists_all  = np.linalg.norm(_X2d - center_all, axis=1)
+            cluster_intra  = {0: float(dists_all.mean())}
+            overall_intra  = float(dists_all.mean())
+
+        intra_dist_history.append({
+            'round':         round_idx + 1,
+            'phase':         'warmup' if is_warmup else 'clustered',
+            'overall_intra': overall_intra,
+            'per_cluster':   cluster_intra,
+        })
+
         del local_weights
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -955,6 +1069,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"正在生成折线图...")
     save_curves(cluster_history, global_history, NUM_CLUSTERS, WARMUP_ROUNDS, run_dir)
+    save_intra_dist_curve(intra_dist_history, NUM_CLUSTERS, WARMUP_ROUNDS, run_dir)
 
     # ===== 打印训练总结 =====
     print(f"\n{'='*80}")
@@ -983,11 +1098,13 @@ def main():
     print(f"{'-'*70}")
 
     print(f"\n本次运行所有结果已保存至: {run_dir}/")
-    print(f"  ├── gmm_cluster_log.json      ← 每次聚类的详细记录")
-    print(f"  ├── cluster_val_results.csv   ← 每轮每簇验证数据")
-    print(f"  ├── global_val_results.csv    ← 每轮全局模型验证数据")
-    print(f"  ├── pixel_accuracy.png        ← Pixel Accuracy 折线图")
-    print(f"  └── miou.png                  ← mIoU 折线图")
+    print(f"  ├── gmm_cluster_log.json           ← 每次聚类的详细记录")
+    print(f"  ├── cluster_val_results.csv        ← 每轮每簇验证数据")
+    print(f"  ├── global_val_results.csv         ← 每轮全局模型验证数据")
+    print(f"  ├── intra_cluster_distance.csv     ← 每轮簇内平均距离数据")
+    print(f"  ├── pixel_accuracy.png             ← Pixel Accuracy 折线图")
+    print(f"  ├── miou.png                       ← mIoU 折线图")
+    print(f"  └── intra_cluster_distance.png     ← 簇内平均距离折线图（论文可视化证据）")
     print(f"\n最优模型: {os.path.join(save_dir, 'best_model_cityscapes.pth')}")
     print(f"最终模型: {final_path}")
 
