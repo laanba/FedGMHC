@@ -227,7 +227,7 @@ if __name__ == '__main__':
         num_classes=NUM_CLASSES,
         alpha=DIRICHLET_ALPHA,
         min_samples=MIN_SAMPLES,
-        random_seed=RANDOM_SEED,
+        seed=RANDOM_SEED,
     )
     # 可选截断
     if MAX_SAMPLES is not None:
