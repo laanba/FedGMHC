@@ -213,7 +213,6 @@ if __name__ == '__main__':
         dataset_root=DATASET_ROOT,
         split=SPLIT,
         num_classes=NUM_CLASSES,
-        ignore_index=IGNORE_INDEX,
     )
     print(f'  共 {len(labels)} 张训练图像')
 
