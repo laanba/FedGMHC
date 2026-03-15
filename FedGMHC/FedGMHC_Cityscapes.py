@@ -9,6 +9,16 @@ FedGMHC_Cityscapes.py — 基于高斯混合模型（GMM）分簇的联邦学习
 - 训练类别: 19 类（road, sidewalk, building, ..., bicycle）
 - 忽略类别: void（trainId=255），CrossEntropyLoss 中 ignore_index=255
 
+极速验证配置（8GB 显存 + MobileUnet）
+--------------------------------------
+本版本针对 8GB 显存单卡进行了全面优化，核心配置如下：
+  - 分辨率: 256×512（保持 1:2 宽高比，保留稀有类语义信息）
+  - 客户端: N=10, Dirichlet α=0.5, 每端 150~200 张
+  - 簇数: K=3（模拟城市核心区/市郊/高速公路三个宏观域）
+  - 热身: 前 10 轮 FedAvg 预热，第 11 轮开始分簇
+  - BN 特征: 仅提取 Bottleneck 层（enc4.18）的 running_mean/running_var
+  - GMM: covariance_type='diag', reg_covar=1e-4，彻底避免奇异矩阵
+
 冷启动解决策略（组合方案）
 --------------------------
 方案一  延迟聚类（热身期）
@@ -29,7 +39,7 @@ FedGMHC_Cityscapes.py — 基于高斯混合模型（GMM）分簇的联邦学习
     每轮结束后，所有簇模型与全局模型保持同步。
 
 首次聚类（Round WARMUP_ROUNDS 结束后）
-    提取各客户端 BN 层 running_mean / running_var，
+    提取各客户端 Bottleneck 层 BN 的 running_mean / running_var，
     拼接为特征向量，拟合 GMM（K = NUM_CLUSTERS，对角协方差），
     按后验概率最大值分配各客户端到对应簇。
 
@@ -86,27 +96,28 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from sklearn.mixture import GaussianMixture
-from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 
 # ==================== 超参数 ====================
-NUM_CLUSTERS        = 3    # GMM 部件数 / 簇数
-WARMUP_ROUNDS       = 5    # 热身轮数：前 N 轮执行标准 FedAvg，之后再首次聚类
-RECLUSTER_INTERVAL  = 5    # 动态重聚类间隔：每隔 5 轮重新聚类一次（0 = 禁用重聚类）
+NUM_CLUSTERS        = 3     # GMM 部件数 / 簇数（模拟城市核心区/市郊/高速公路）
+WARMUP_ROUNDS       = 10    # 热身轮数：前 10 轮执行标准 FedAvg，之后再首次聚类
+RECLUSTER_INTERVAL  = 5     # 动态重聚类间隔：每隔 5 轮重新聚类一次（0 = 禁用重聚类）
 # 重聚类后簇模型融合比例：新簇模型 = α × 全局模型 + (1-α) × 当前簇模型
 # α=0 完全保留原簇模型；α=1 等同于硬重置；推荐 0.2~0.4
 RECLUSTER_ALPHA     = 0.3
-# PCA 目标维度：固定为 2 维
-# 2 维的优势：
-#   1. 参数数量极少（GMM 每部件只需 2+2+1=5 个参数），10个样本下不会奇异
-#   2. 可直接生成 2D 散点图，直观展示客户端聚类分布，适合放入论文
-PCA_N_COMPONENTS    = 2     # 固定 2 维，保证 GMM 数値稳定
+
+# ==================== BN 特征提取策略 ====================
+# 仅提取 Bottleneck 层（enc4.18）的 BN 统计量
+# enc4.18 是 MobileNetV2 编码器最后一层 ConvBNReLU，输出 1280 维
+# 提取 running_mean(1280) + running_var(1280) = 2560 维特征向量
+# 配合 covariance_type='diag'，10 个客户端完全可行，无需 PCA 降维
+BOTTLENECK_BN_PREFIX = 'enc4.18'
+
 # GMM 后验概率温度软化参数
-# 问题：2D PCA 后簇间距离过大，GMM 后验概率容易全部崩塑为 0/1（硬分簇）
-# 解决：用温度系数 T 软化 log 概率，T 越大概率越均匀
+# 用温度系数 T 软化后验概率，T 越大概率越均匀
 # T=1 为原始 GMM 概率；T=5~10 通常能有效软化；T=∞ 则均匀分配
-GMM_TEMPERATURE     = 5.0   # 推荐范围 2.0~10.0；调大软化程度加强，调小接近硬分簇
+GMM_TEMPERATURE     = 5.0   # 推荐范围 2.0~10.0
 
 
 # ==================== 显存监控工具 ====================
@@ -140,14 +151,14 @@ def print_gpu_status(device, label=""):
 
 def auto_batch_size(device, num_data_per_client, base_batch_size=8):
     """
-    Cityscapes 图像尺寸为 (512, 1024)，显存占用远大于 CamVid (256, 256)，
-    因此 base_batch_size 默认调低为 8，每张图约占 ~100MB 显存。
+    Cityscapes 图像尺寸为 (256, 512)，显存占用适中，
+    base_batch_size 默认为 8，8GB 显存完全可以支撑。
     """
     data_limit = max(4, num_data_per_client // 4)
     if torch.cuda.is_available():
         total     = torch.cuda.get_device_properties(device).total_memory / 1024 ** 2
-        # Cityscapes 512×1024 每张约占 100MB（含梯度），保留 1GB 余量
-        gpu_limit = int((total - 1000) / 100)
+        # Cityscapes 256×512 每张约占 50MB（含梯度），保留 1GB 余量
+        gpu_limit = int((total - 1000) / 50)
         gpu_limit = max(2, gpu_limit)
     else:
         gpu_limit = base_batch_size
@@ -207,16 +218,24 @@ def evaluate_model(model, val_loader, device, use_amp=True):
     return (total_pa / n if n else 0.0), (total_miou / n if n else 0.0)
 
 
-# ==================== BN 特征提取 ====================
+# ==================== BN 特征提取（仅 Bottleneck 层）====================
 
 def extract_bn_feature(state_dict):
     """
-    从模型 state_dict 中提取所有 BatchNorm 层的
-    running_mean 和 running_var，拼接为一维特征向量（numpy）。
+    从模型 state_dict 中仅提取 Bottleneck 层（enc4.18）的
+    BatchNorm running_mean 和 running_var，拼接为一维特征向量（numpy）。
+
+    设计理由：
+      - Bottleneck 包含了最高级、最压缩的语义与域特征
+      - enc4.18 是 MobileNetV2 编码器最后一层 ConvBNReLU，输出 1280 维
+      - 提取 running_mean(1280) + running_var(1280) = 2560 维
+      - 配合 GMM covariance_type='diag'，10 个客户端完全可行
+      - 无需 PCA 降维，避免信息损失
     """
     parts = []
     for key, val in state_dict.items():
-        if 'running_mean' in key or 'running_var' in key:
+        if key.startswith(BOTTLENECK_BN_PREFIX) and \
+           ('running_mean' in key or 'running_var' in key):
             parts.append(val.cpu().float().numpy().ravel())
     return np.concatenate(parts) if parts else np.array([])
 
@@ -226,17 +245,20 @@ def extract_bn_feature(state_dict):
 def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_dir,
                        cluster_log, prev_assignments=None):
     """
-    提取 BN 特征 → 标准化 → PCA 降维（2维）→ 拟合 GMM → 温度软化后验概率 → 返回软分配权重。
+    提取 Bottleneck 层 BN 特征 → 标准化 → 拟合 GMM（对角协方差）
+    → 温度软化后验概率 → 返回软分配权重。
 
     核心设计：
-      - 不再使用 K-Means++ 底底；若 GMM 全部失败则抛出异常
-      - 用温度系数 T 软化 GMM 后验概率，解决 2D 空间簇间距离过大导致概率崩塑为 0/1 的问题
+      - 仅提取 Bottleneck 层 BN 统计量，特征维度 ~2560
+      - 强制使用 covariance_type='diag'，避免高维协方差矩阵求逆崩溃
+      - reg_covar=1e-4，彻底防止方差为 0 导致的除零报错
+      - 用温度系数 T 软化后验概率，解决簇间距离过大导致概率崩塑为 0/1 的问题
       - 返回软权重矩阵 posteriors[i, k] 表示客户端 i 对簇 k 的贡献权重
     """
-    print(f"\n  [GMM] 提取 BN 层统计特征（Round {round_idx + 1}）...")
+    print(f"\n  [GMM] 提取 Bottleneck 层 BN 统计特征（Round {round_idx + 1}）...")
     features = [extract_bn_feature(w) for w in local_weights]
     feat_dim = features[0].shape[0]
-    print(f"  [GMM] 原始特征向量维度: {feat_dim}")
+    print(f"  [GMM] Bottleneck BN 特征向量维度: {feat_dim}")
 
     X = np.stack(features, axis=0)   # (N, D)
     N = X.shape[0]
@@ -246,75 +268,64 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
     scaler   = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # ---- Step 2: PCA 降维（固定 2 维）----
-    # 2 维保证 GMM 数值稳定，且可生成 2D 散点图
-    n_components = max(2, min(PCA_N_COMPONENTS, N - 1, feat_dim))
-
-    pca   = PCA(n_components=n_components, random_state=42)
-    X_pca = pca.fit_transform(X_scaled).astype(np.float64)
-
-    explained_var = pca.explained_variance_ratio_.sum() * 100
-    print(f"  [GMM] PCA 降维: {feat_dim} → {n_components} 维 "
-          f"（累计解释方差: {explained_var:.1f}%）")
-
-    # ---- Step 3: 拟合 GMM（full 协方差，2维下完全可行）----
-    def _fit_gmm(X_data, k, reg, cov_type='full'):
+    # ---- Step 2: 拟合 GMM（对角协方差，数值稳定）----
+    # covariance_type='diag'：假设各特征维度独立，只需估计对角线方差
+    # 完全避开高维矩阵求逆的崩溃问题
+    # reg_covar=1e-4：在对角线上加正则化常数，防止方差为 0
+    gmm = GaussianMixture(
+        n_components=effective_k,
+        covariance_type='diag',
+        max_iter=500,
+        n_init=10,
+        random_state=42,
+        reg_covar=1e-4,
+    )
+    try:
+        gmm.fit(X_scaled)
+        print(f"  [GMM] 拟合成功 (covariance_type='diag', reg_covar=1e-4)")
+    except (ValueError, np.linalg.LinAlgError) as e:
+        # 极端情况下的降级方案：增大正则化
+        print(f"  [GMM] 首次拟合失败 ({e})，尝试增大正则化...")
         gmm = GaussianMixture(
-            n_components=k,
-            covariance_type=cov_type,
+            n_components=effective_k,
+            covariance_type='diag',
             max_iter=500,
             n_init=10,
-            random_state=None,
-            reg_covar=reg,
+            random_state=42,
+            reg_covar=1e-2,
         )
-        gmm.fit(X_data)
-        return gmm
+        gmm.fit(X_scaled)
+        print(f"  [GMM] 拟合成功 (covariance_type='diag', reg_covar=1e-2)")
 
-    reg_list = [1e-3, 1e-2, 1e-1, 0.5, 1.0]
-    gmm = None
-    for reg in reg_list:
-        for cov_type in ['full', 'diag']:
-            try:
-                gmm = _fit_gmm(X_pca, effective_k, reg, cov_type)
-                print(f"  [GMM] 拟合成功 (covariance_type={cov_type}, reg_covar={reg})")
-                break
-            except (ValueError, np.linalg.LinAlgError):
-                pass
-        if gmm is not None:
-            break
-
-    if gmm is None:
-        raise RuntimeError(
-            f"[GMM] 拟合全部失败（reg 尝试范围: {reg_list}），"
-            f"请检查 BN 特征是否全为零或客户端数量过少。"
-        )
-
-    # ---- Step 4: 基于欧式距离的温度 softmax 软化 ----
-    # 问题根源：2D PCA 后簇间距离高达万级，log 概率差异远超过 T 的调节能力
-    # 解决：用到簇中心的欧式距离做温度 softmax
-    #   posteriors[i, k] = softmax(-dist(x_i, mu_k) / T)
+    # ---- Step 3: 基于欧式距离的温度 softmax 软化 ----
+    # posteriors[i, k] = softmax(-dist(x_i, mu_k) / T)
     # 距离越小概率越高；T 越大概率越均匀；T 越小越接近硬分簇
     means = gmm.means_                                                 # (K, D)
     dists = np.linalg.norm(
-        X_pca[:, None, :] - means[None, :, :], axis=2
+        X_scaled[:, None, :] - means[None, :, :], axis=2
     )                                                                  # (N, K)
     neg_dist_T = -dists / GMM_TEMPERATURE
-    neg_dist_T -= neg_dist_T.max(axis=1, keepdims=True)               # 数値稳定
+    neg_dist_T -= neg_dist_T.max(axis=1, keepdims=True)               # 数值稳定
     posteriors  = np.exp(neg_dist_T)
     posteriors /= posteriors.sum(axis=1, keepdims=True)               # 归一化为概率
 
     max_probs       = posteriors.max(axis=1)
-    new_assignments = posteriors.argmax(axis=1).tolist()   # 硬分簇结果（仅用于日志和重聚类判断）
+    new_assignments = posteriors.argmax(axis=1).tolist()
     changed         = (prev_assignments is None) or (new_assignments != prev_assignments)
 
     print(f"  [GMM] 欧式距离温度软化（T={GMM_TEMPERATURE}）:")
     print(f"        最大概率范围: {max_probs.min():.3f} ~ {max_probs.max():.3f}（T=1时通常为 0.99+）")
     print(f"        各簇平均权重: {posteriors.mean(axis=0).round(3).tolist()}")
 
-    def _save_scatter(X_2d, labels, post, run_dir, round_idx):
-        """生成 2D 聚类散点图，点的颜色混合反映软分簇权重。"""
-        if X_2d.shape[1] != 2:
-            return
+    def _save_scatter(X_data, labels, post, run_dir, round_idx):
+        """生成 2D 聚类散点图（对高维特征用 PCA 降到 2D 仅用于可视化）。"""
+        from sklearn.decomposition import PCA as PCA_vis
+        if X_data.shape[1] > 2:
+            pca_vis = PCA_vis(n_components=2, random_state=42)
+            X_2d = pca_vis.fit_transform(X_data)
+        else:
+            X_2d = X_data
+
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
@@ -368,16 +379,17 @@ def run_gmm_clustering(local_weights, num_clients, n_clusters, round_idx, run_di
     if not changed:
         print(f"  [GMM] 主簇分配结果与上次相同。")
 
-    _save_scatter(X_pca, new_assignments, posteriors, run_dir, round_idx)
+    _save_scatter(X_scaled, new_assignments, posteriors, run_dir, round_idx)
 
     cluster_log.append({
         'round':                 round_idx + 1,
         'trigger':               'warmup_end' if prev_assignments is None else 'recluster',
         'method':                'gmm_soft',
         'temperature':           GMM_TEMPERATURE,
-        'feature_dim_raw':       int(feat_dim),
-        'feature_dim_pca':       int(n_components),
-        'pca_explained_var_pct': round(float(explained_var), 2),
+        'feature_dim':           int(feat_dim),
+        'feature_source':        f'Bottleneck BN ({BOTTLENECK_BN_PREFIX})',
+        'gmm_covariance_type':   'diag',
+        'gmm_reg_covar':         1e-4,
         'assignments':           new_assignments,
         'changed':               changed,
         'posteriors':            posteriors.tolist(),
@@ -440,7 +452,7 @@ class Client:
         self.dataset   = dataset
         self.indices   = indices
 
-    def local_train(self, model, batch_size=4, epochs=1, lr=0.01,
+    def local_train(self, model, batch_size=8, epochs=1, lr=0.01,
                     num_workers=0, pin_memory=False):
         loader = DataLoader(
             Subset(self.dataset, self.indices),
@@ -612,7 +624,7 @@ def save_intra_dist_curve(intra_dist_history, num_clusters, warmup_rounds, run_d
             color='black', label='Overall Mean')
 
     ax.set_xlabel('Communication Round', fontsize=13)
-    ax.set_ylabel('Intra-cluster Distance (PCA 2D)', fontsize=13)
+    ax.set_ylabel('Intra-cluster Distance (Bottleneck BN Feature Space)', fontsize=13)
     ax.set_title('FedGMHC — Intra-cluster Distance vs. Round\n'
                  '(Decreasing trend indicates increasing intra-cluster cohesion)', fontsize=13)
     ax.legend(fontsize=10, loc='upper right')
@@ -665,40 +677,34 @@ def main():
 
     USE_AMP      = True
     # Cityscapes 原始分辨率为 1024×2048；保持宽高比 1:2
-    # 128×256 快速调试模式，显存占用约为 256×512 的 1/4
-    TARGET_SIZE  = (128, 256)
+    # 256×512 是 8GB 显存下的最佳平衡点：
+    #   - 保留行人、交通标志等稀有类的语义信息
+    #   - 8GB 显存可支撑 Batch_Size=8 甚至 16
+    #   - 比 128×256 大幅提升分割质量（128×256 会导致稀有类丢失）
+    TARGET_SIZE  = (256, 512)
 
-    # ==================== 快速调试模式开关 ====================
-    # DEBUG_MODE=True 时使用小参数，单次实验可在 15~20 分钟内完成
-    # 确认趋势正确后，将 DEBUG_MODE 改为 False 再跑完整实验
-    DEBUG_MODE   = True
-    # =====================================================================
-
-    if DEBUG_MODE:
-        NUM_ROUNDS      = 20    # 快速模式：20轮（全量 50 轮）
-        NUM_CLIENTS     = 20    # 增加到 20 个客户端，增大 GMM 样本量，改善软分簇效果
-        LOCAL_EPOCHS    = 1
-        LR              = 0.01
-        BATCH_SIZE      = 8
-        DIRICHLET_ALPHA = 0.5   # 强异质性，更容易看出聚类优势
-        MIN_SAMPLES     = 30    # 每客户端最少 30 张
-        MAX_SAMPLES     = 50    # 每客户端最多 50 张（大幅缩短每轮训练时间）
-        EVAL_EVERY      = 2     # 每 2 轮验证一次（节省验证时间）
-        print("[DEBUG MODE] 快速调试模式已开启：20轮 / 20客户端 / MAX_SAMPLES=50 / 每2轮验证")
-    else:
-        NUM_ROUNDS      = 50    # 完整实验轮数
-        NUM_CLIENTS     = 20    # 增加到 20 个客户端
-        LOCAL_EPOCHS    = 1
-        LR              = 0.01
-        BATCH_SIZE      = 8
-        DIRICHLET_ALPHA = 0.5
-        MIN_SAMPLES     = 100
-        MAX_SAMPLES     = 200
-        EVAL_EVERY      = 1     # 每轮都验证
+    # ==================== 极速验证配置 ====================
+    # 针对 8GB 显存 + MobileUnet 的敏捷验证参数
+    NUM_ROUNDS      = 50    # 联邦总轮次（前 10 轮 FedAvg 预热 + 40 轮分簇训练）
+    NUM_CLIENTS     = 10    # 10 个客户端足够模拟 Non-IID 异质性
+    LOCAL_EPOCHS    = 1     # Non-IID 下 Local Epoch 越大权重漂移越严重，设为 1 最有利于快速收敛
+    LR              = 0.01
+    BATCH_SIZE      = 8     # 256×512 分辨率下，8GB 显存完全可以支撑 Batch_Size=8
+    DIRICHLET_ALPHA = 0.5   # 强异质性，更容易看出聚类优势
+    MIN_SAMPLES     = 150   # 每客户端最少 150 张
+    MAX_SAMPLES     = 200   # 每客户端最多 200 张（共计消耗 1500~2000 张数据）
+    EVAL_EVERY      = 1     # 每轮都验证
 
     NUM_WORKERS  = 0 if sys.platform == 'win32' else 4
     PIN_MEMORY   = True
     # ================================================
+
+    print(f"\n[极速验证配置]")
+    print(f"  分辨率: {TARGET_SIZE[0]}×{TARGET_SIZE[1]} | 客户端: {NUM_CLIENTS} | 簇数: {NUM_CLUSTERS}")
+    print(f"  每端数据: {MIN_SAMPLES}~{MAX_SAMPLES} 张 | Dirichlet α={DIRICHLET_ALPHA}")
+    print(f"  热身轮数: {WARMUP_ROUNDS} | 总轮次: {NUM_ROUNDS}")
+    print(f"  BN 特征: 仅 Bottleneck 层 ({BOTTLENECK_BN_PREFIX})")
+    print(f"  GMM: K={NUM_CLUSTERS}, covariance_type='diag', reg_covar=1e-4")
 
     # ===== 时间戳运行目录 =====
     run_timestamp = datetime.now().strftime('%m%d%H%M')
@@ -753,7 +759,7 @@ def main():
         BATCH_SIZE = auto_batch_size(device, min_data)
 
     print(f"\n{'='*65}")
-    print(f"训练配置（Cityscapes）:")
+    print(f"训练配置（Cityscapes 极速验证）:")
     print(f"  数据集根目录: {DATASET_ROOT}")
     print(f"  图像尺寸: {TARGET_SIZE[0]}×{TARGET_SIZE[1]}  |  训练类别: {NUM_CLASSES}  |  IGNORE_INDEX: {IGNORE_INDEX}")
     print(f"  训练集: {num_images} 张 | 验证集: {len(val_dataset)} 张")
@@ -764,6 +770,8 @@ def main():
     print(f"  热身轮数: {WARMUP_ROUNDS} | 重聚类间隔: {_recluster_str}")
     print(f"  Batch Size: {BATCH_SIZE} | Local Epochs: {LOCAL_EPOCHS} | 联邦轮数: {NUM_ROUNDS}")
     print(f"  学习率: {LR} | AMP: {'已启用' if USE_AMP and torch.cuda.is_available() else '未启用'}")
+    print(f"  BN 特征提取: 仅 Bottleneck 层 ({BOTTLENECK_BN_PREFIX})")
+    print(f"  GMM 协方差类型: diag | GMM 正则化: 1e-4")
     print(f"{'='*65}")
 
     # ===== 初始化全局模型 =====
@@ -797,7 +805,7 @@ def main():
     total_time         = 0.0
 
     print(f"\n{'='*80}")
-    print(f"开始 FedGMHC 训练（Cityscapes）")
+    print(f"开始 FedGMHC 训练（Cityscapes 极速验证）")
     print(f"热身 {WARMUP_ROUNDS} 轮 + 动态重聚类间隔 "
           f"{'禁用' if RECLUSTER_INTERVAL == 0 else RECLUSTER_INTERVAL} 轮")
     print(f"{'='*80}")
@@ -854,7 +862,7 @@ def main():
         # 阶段 C：热身期结束后 → 首次 GMM 聚类
         # ================================================================
         if round_idx == WARMUP_ROUNDS - 1:
-            print(f"\n  [GMM] 热身期结束，执行首次聚类...")
+            print(f"\n  [GMM] 热身期结束（{WARMUP_ROUNDS} 轮），执行首次聚类...")
             client_cluster, _, client_posteriors = run_gmm_clustering(
                 local_weights, NUM_CLIENTS, NUM_CLUSTERS,
                 round_idx, run_dir, cluster_log,
@@ -889,7 +897,7 @@ def main():
                             changed_clusters.add(new_assignments[i])
                     for k in changed_clusters:
                         interpolate_models(cluster_models[k], global_model, RECLUSTER_ALPHA)
-                        print(f"  [GMM] Cluster {k} 模型已插値融合 "
+                        print(f"  [GMM] Cluster {k} 模型已插值融合 "
                               f"(α={RECLUSTER_ALPHA}: {RECLUSTER_ALPHA:.0%} 全局 + "
                               f"{1-RECLUSTER_ALPHA:.0%} 原簇，因有新成员加入)")
                 client_cluster     = new_assignments
@@ -929,13 +937,10 @@ def main():
         # ================================================================
         # 阶段 D+: 计算并记录每轮簇内平均距离（用于可视化方法有效性）
         # ================================================================
-        # 提取当前轮所有客户端的 BN 特征，标准化后做 PCA 降维
+        # 提取当前轮所有客户端的 Bottleneck BN 特征，标准化后计算距离
         _feats = np.stack([extract_bn_feature(w) for w in local_weights], axis=0)  # (N, D)
         _scaler = StandardScaler()
         _feats_scaled = _scaler.fit_transform(_feats)
-        _n_comp = max(2, min(PCA_N_COMPONENTS, NUM_CLIENTS - 1, _feats_scaled.shape[1]))
-        _pca = PCA(n_components=_n_comp, random_state=42)
-        _X2d = _pca.fit_transform(_feats_scaled)  # (N, 2)
 
         if client_cluster is not None and client_posteriors is not None:
             # 分簇期：计算每个簇的加权内聚距离（用软权重加权平均）
@@ -945,16 +950,16 @@ def main():
                 weights_k = client_posteriors[:, k]          # (N,)
                 if weights_k.sum() < 1e-8:
                     continue
-                center_k = np.average(_X2d, axis=0, weights=weights_k)  # (2,)
+                center_k = np.average(_feats_scaled, axis=0, weights=weights_k)
                 # 簇内平均距离：各客户端到簇中心的距离，按软权重加权平均
-                dists_k = np.linalg.norm(_X2d - center_k, axis=1)       # (N,)
+                dists_k = np.linalg.norm(_feats_scaled - center_k, axis=1)
                 intra_k = float(np.average(dists_k, weights=weights_k))
                 cluster_intra[k] = intra_k
             overall_intra = float(np.mean(list(cluster_intra.values()))) if cluster_intra else None
         else:
             # 热身期：所有客户端当作一个簇，计算全局内聚距离
-            center_all = _X2d.mean(axis=0)
-            dists_all  = np.linalg.norm(_X2d - center_all, axis=1)
+            center_all = _feats_scaled.mean(axis=0)
+            dists_all  = np.linalg.norm(_feats_scaled - center_all, axis=1)
             cluster_intra  = {0: float(dists_all.mean())}
             overall_intra  = float(dists_all.mean())
 
@@ -1073,7 +1078,7 @@ def main():
 
     # ===== 打印训练总结 =====
     print(f"\n{'='*80}")
-    print(f"训练完成！总结如下（Cityscapes）：")
+    print(f"训练完成！总结如下（Cityscapes 极速验证）：")
     print(f"{'='*80}")
 
     if torch.cuda.is_available():
@@ -1089,6 +1094,12 @@ def main():
     print(f"  平均每轮耗时: {total_time/NUM_ROUNDS:.1f}s")
     print(f"  最优全局 mIoU: {best_miou:.4f}")
     print(f"  GMM 聚类次数: {len(cluster_log)} 次")
+
+    print(f"\n[极速验证配置回顾]")
+    print(f"  分辨率: {TARGET_SIZE[0]}×{TARGET_SIZE[1]} | 客户端: {NUM_CLIENTS} | 簇数: {NUM_CLUSTERS}")
+    print(f"  每端数据: {MIN_SAMPLES}~{MAX_SAMPLES} 张 | Dirichlet α={DIRICHLET_ALPHA}")
+    print(f"  热身轮数: {WARMUP_ROUNDS} | BN 特征: Bottleneck ({BOTTLENECK_BN_PREFIX})")
+    print(f"  GMM: covariance_type='diag', reg_covar=1e-4")
 
     print(f"\n{'Round':<8} {'Phase':<12} {'Loss':<12} {'Pixel Acc':<14} {'mIoU':<14} {'耗时(s)':<10}")
     print(f"{'-'*70}")
